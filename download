@@ -1,0 +1,6 @@
+.streamlit/secrets.toml
+__pycache__/
+*.pyc
+*.fydb
+bc.db
+portfolio_db.json

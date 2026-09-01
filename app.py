@@ -13,18 +13,6 @@ from __future__ import annotations
 # ==========================================================================
 # KAYNAK: portfolio/classification.py
 # ==========================================================================
-"""
-Varlık sınıflandırma ve otomatik tanıma motoru.
-
-TASARIM KARARI (önemli):
-  - "source"  = fiyatın NEREDEN çekileceği (teknik)
-  - "ana_sinif / alt_sinif / sektor" = varlığın NASIL gruplanacağı (sunum)
-Bu ikisi ayrıdır. Eski kodda tek bir "type" alanı her iki işi birden yapıyordu,
-bu yüzden sınıflandırmayı değiştirmek fiyat çekmeyi bozuyordu.
-
-Sınıflandırma hiyerarşisini değiştirmek için sadece HIERARCHY ve
-SMART_DATABASE'i düzenleyin; başka hiçbir dosyaya dokunmanız gerekmez.
-"""
 
 
 import re
@@ -324,6 +312,7 @@ def normalize_asset(item: dict[str, Any]) -> dict[str, Any]:
     item["avg_cost"] = float(item.get("avg_cost") or 0.0)
     item.setdefault("hesap", "")
     item.setdefault("notlar", "")
+    item.setdefault("manual_price", None)
     if item.get("source") not in VALID_SOURCES:
         item["source"] = SRC_YAHOO
 
@@ -345,19 +334,6 @@ def asset_key(item: dict[str, Any]) -> str:
 # ==========================================================================
 # KAYNAK: portfolio/prices.py
 # ==========================================================================
-"""
-Canlı fiyat motoru.
-
-Eski koddaki sorunlar ve çözümleri:
-  * `except: pass`  -> hata yutuluyordu, fiyat sessizce eskiden kalıyordu.
-    Artık her varlık için (fiyat, kaynak, hata) üçlüsü döner, arayüz gösterir.
-  * TEFAS HTML scraping -> sayfa JavaScript ile dolduğu için BeautifulSoup
-    her zaman boş dönerdi. Artık sitenin kendi POST API'si kullanılıyor.
-  * `if True else` -> anlamsız ifade, kur çekilemezse uygulama çöküyordu.
-    Artık kur başarısız olursa açıkça uyarı verilir.
-  * Her sembol için ayrı yfinance çağrısı -> yavaş. Artık tek toplu çağrı.
-  * Altın sadece gram varsayılıyordu -> artık çeyrek/tam/ons birimleri var.
-"""
 
 
 import datetime as dt
@@ -678,30 +654,6 @@ def _now_istanbul() -> str:
 # ==========================================================================
 # KAYNAK: portfolio/storage.py
 # ==========================================================================
-"""
-Kalıcı depolama: GitHub Contents API üzerinden JSON commit'leme.
-
-NEDEN: Streamlit Community Cloud'da dosya sistemi geçicidir. Uygulama uykuya
-girip uyandığında ya da yeniden deploy olduğunda `open(...,"w")` ile yazdığınız
-my_assets.json SİLİNİR. Eklediğiniz varlıklar kaybolur. Bu yüzden portföy
-kaydı doğrudan GitHub deposuna commit edilir; depo tek doğruluk kaynağıdır.
-
-KURULUM
--------
-1) GitHub'da ince taneli (fine-grained) bir kişisel erişim jetonu üretin:
-   Settings > Developer settings > Personal access tokens > Fine-grained tokens
-   - Repository access: sadece bu depo
-   - Permissions > Repository permissions > Contents: Read and write
-2) Streamlit Cloud > App > Settings > Secrets alanına şunu yapıştırın:
-
-   [github]
-   token  = "github_pat_..."
-   repo   = "kullanici-adi/depo-adi"
-   branch = "main"
-   path   = "my_assets.json"
-
-Jeton yoksa uygulama otomatik olarak yerel dosya moduna düşer (lokal geliştirme).
-"""
 
 
 import base64
@@ -856,18 +808,6 @@ def storage_from_secrets(secrets: Any, local_path: str = DEFAULT_PATH) -> Storag
 # ==========================================================================
 # KAYNAK: portfolio/analytics.py
 # ==========================================================================
-"""
-Portföy hesaplamaları ve grafik verisi üretimi.
-
-Buradaki iki kritik düzeltme:
-  1) Sankey düğüm çakışması: eski kodda etiketler tek bir sözlükte toplanıyordu.
-     Bir sektör adı bir alt sınıf adıyla (veya bir sembol bir sektörle) aynı
-     olduğunda düğümler birleşiyor, akışlar yanlış yere gidiyordu. Artık her
-     düğümün kimliği tam yol ("Hisse Senedi > BIST > Bankacılık") üzerinden
-     üretiliyor; etikette sadece son parça gösteriliyor.
-  2) Toplam kâr/zarar yüzdesi: satır bazlı yüzdelerin ortalaması yanlıştır.
-     Toplam, TL cinsinden maliyet ve değer üzerinden hesaplanır.
-"""
 
 
 from typing import Any
@@ -976,9 +916,34 @@ def build_dataframe(assets: list[dict[str, Any]], quotes: dict[str, Any],
     if df.empty:
         return df
 
+    df["Etiket"] = _unique_labels(df)
     total = df["Değer (TRY)"].sum(skipna=True)
     df["Ağırlık %"] = (df["Değer (TRY)"] / total * 100.0) if total else float("nan")
     return df.sort_values("Değer (TRY)", ascending=False, na_position="last")
+
+
+def _unique_labels(df: pd.DataFrame) -> pd.Series:
+    """
+    Grafik ekseninde kullanılacak TEKİL etiket üretir.
+
+    Portföyde aynı ada sahip birden çok pozisyon olabiliyor (BIST'teki 'YK' ile
+    fon hesabındaki 'YK' gibi). Aynı etiketle çizilirlerse Plotly onları tek
+    kategoride üst üste yığar ve çubuk grafik yanlış okunur. Tekrar eden adlara
+    önce alt sınıf, gerekirse hesap adı eklenir.
+    """
+    labels = df["Sembol"].astype(str).copy()
+    dupe = labels.duplicated(keep=False)
+    if dupe.any():
+        labels[dupe] = labels[dupe] + " · " + df.loc[dupe, "Alt Sınıf"].astype(str)
+        still = labels.duplicated(keep=False)
+        if still.any():
+            labels[still] = labels[still] + " · " + df.loc[still, "Hesap"].astype(str)
+            # Hesap da aynıysa sıra numarası ver — hiçbir zaman çakışmasın
+            final = labels.duplicated(keep=False)
+            if final.any():
+                labels[final] = [f"{v} ({i + 1})"
+                                 for i, v in enumerate(labels[final])]
+    return labels
 
 
 BORC_SINIFLARI = {"Yükümlülük"}
@@ -1026,6 +991,44 @@ def allocation(df: pd.DataFrame, level: str) -> pd.DataFrame:
     return g.sort_values("Değer (TRY)", ascending=False)
 
 
+def _row_paths(valid: pd.DataFrame, levels: list[str]) -> list[tuple]:
+    """
+    Her satır için hiyerarşi yolunu üretir ve ÜST ÜSTE GELEN aynı etiketleri
+    teker. Örneğin alt sınıfı 'Gümüş', sektörü de 'Gümüş' olan bir satır
+    "Emtia > Gümüş > Gümüş" değil "Emtia > Gümüş" olur; grafiklerde anlamsız
+    tekrarlar kaybolur.
+    """
+    out: list[tuple] = []
+    for _, r in valid.iterrows():
+        path: list[str] = []
+        for lv in levels:
+            raw = r.get(lv)
+            label = "Belirsiz" if raw is None or pd.isna(raw) else str(raw).strip()
+            label = label or "Belirsiz"
+            if not path or path[-1] != label:
+                path.append(label)
+        out.append((tuple(path), float(r["Değer (TRY)"])))
+    return out
+
+
+def _hierarchy_nodes(valid: pd.DataFrame,
+                     levels: list[str]) -> tuple[dict[tuple, float], dict[tuple, str]]:
+    """Yol öneklerinin toplamları ve her düğümün ait olduğu ana grup."""
+    totals: dict[tuple, float] = {}
+    group: dict[tuple, str] = {}
+    for path, value in _row_paths(valid, levels):
+        for depth in range(1, len(path) + 1):
+            key = path[:depth]
+            totals[key] = totals.get(key, 0.0) + value
+            group[key] = path[0]
+    return totals, group
+
+
+def _sorted_keys(totals: dict[tuple, float]) -> list[tuple]:
+    """Önce sığ düğümler, sonra büyükten küçüğe."""
+    return sorted(totals, key=lambda k: (len(k), -totals[k]))
+
+
 def sankey_data(df: pd.DataFrame, levels: list[str]) -> dict[str, Any]:
     """
     Çok seviyeli akış diyagramı için düğüm/bağlantı verisi.
@@ -1040,48 +1043,31 @@ def sankey_data(df: pd.DataFrame, levels: list[str]) -> dict[str, Any]:
         return {"labels": [], "paths": [], "source": [], "target": [], "value": [],
                 "node_colors": [], "link_colors": []}
 
-    root_key = "__ROOT__"
-    node_ids: dict[str, int] = {root_key: 0}
+    totals, group = _hierarchy_nodes(valid, levels)
+    top_colors = color_map(list(allocation(valid, levels[0])[levels[0]].astype(str)))
+
     labels: list[str] = ["Portföy"]
     paths: list[str] = ["Portföy"]
-
-    top_level = levels[0]
-    top_colors = color_map(
-        list(allocation(valid, top_level)[top_level].astype(str))
-    )
     node_colors: list[str] = [ACCENT]
-    node_group: list[str] = ["Portföy"]
+    index: dict[tuple, int] = {}
 
-    def node(path: tuple[str, ...], group: str) -> int:
-        key = " > ".join(path)
-        if key not in node_ids:
-            node_ids[key] = len(labels)
-            labels.append(path[-1])
-            paths.append(key)
-            node_colors.append(top_colors.get(group, OTHER_COLOR))
-            node_group.append(group)
-        return node_ids[key]
+    for key in _sorted_keys(totals):
+        index[key] = len(labels)
+        labels.append(key[-1])
+        paths.append(" › ".join(key))
+        node_colors.append(top_colors.get(group[key], OTHER_COLOR))
 
     src: list[int] = []
     tgt: list[int] = []
     val: list[float] = []
     link_colors: list[str] = []
 
-    for depth in range(len(levels)):
-        keys = levels[: depth + 1]
-        grouped = valid.groupby([valid[k].fillna("Belirsiz").astype(str) for k in keys],
-                                dropna=False)["Değer (TRY)"].sum(min_count=1)
-        for combo, amount in grouped.items():
-            if amount is None or amount <= 0:
-                continue
-            combo = combo if isinstance(combo, tuple) else (combo,)
-            group = combo[0]
-            parent = 0 if depth == 0 else node(combo[:-1], group)
-            child = node(combo, group)
-            src.append(parent)
-            tgt.append(child)
-            val.append(float(amount))
-            link_colors.append(_rgba(top_colors.get(group, OTHER_COLOR), 0.35))
+    for key, amount in totals.items():
+        parent = 0 if len(key) == 1 else index[key[:-1]]
+        src.append(parent)
+        tgt.append(index[key])
+        val.append(amount)
+        link_colors.append(_rgba(top_colors.get(group[key], OTHER_COLOR), 0.32))
 
     return {
         "labels": labels,
@@ -1092,6 +1078,43 @@ def sankey_data(df: pd.DataFrame, levels: list[str]) -> dict[str, Any]:
         "node_colors": node_colors,
         "link_colors": link_colors,
     }
+
+
+def treemap_data(df: pd.DataFrame, levels: list[str]) -> dict[str, Any]:
+    """
+    Treemap için ids/labels/parents/values. Sankey ile aynı hiyerarşiyi kullanır
+    ama büyüklüğü alan olarak gösterdiği için 30+ pozisyonda çok daha okunaklıdır.
+    """
+    empty = {"ids": [], "labels": [], "parents": [], "values": [],
+             "colors": [], "paths": []}
+    if df.empty or "Değer (TRY)" not in df.columns or not levels:
+        return empty
+    valid = df[df["Değer (TRY)"].notna() & (df["Değer (TRY)"] > 0)]
+    if valid.empty:
+        return empty
+
+    totals, group = _hierarchy_nodes(valid, levels)
+    top_colors = color_map(list(allocation(valid, levels[0])[levels[0]].astype(str)))
+    max_depth = max((len(k) for k in totals), default=1)
+
+    ids: list[str] = []
+    labels: list[str] = []
+    parents: list[str] = []
+    values: list[float] = []
+    colors: list[str] = []
+
+    for key in _sorted_keys(totals):
+        ids.append(" › ".join(key))
+        labels.append(key[-1])
+        parents.append(" › ".join(key[:-1]) if len(key) > 1 else "")
+        values.append(totals[key])
+        # Derinleştikçe saydamlaşan dolgu: iç içe kutular birbirinden ayrışır
+        alpha = 0.88 - 0.16 * min(len(key) - 1, max(max_depth - 1, 1))
+        colors.append(_rgba(top_colors.get(group[key], OTHER_COLOR),
+                            max(alpha, 0.34)))
+
+    return {"ids": ids, "labels": labels, "parents": parents,
+            "values": values, "colors": colors, "paths": ids}
 
 
 def _rgba(hex_color: str, alpha: float) -> str:
@@ -1134,6 +1157,121 @@ def merge_position(assets: list[dict[str, Any]], new: dict[str, Any],
     return out
 
 # ==========================================================================
+# KAYNAK: portfolio/editing.py
+# ==========================================================================
+
+
+from typing import Any
+
+import pandas as pd
+
+
+SOURCE_LABELS: dict[str, str] = {
+    SRC_YAHOO: "Yahoo Finance",
+    SRC_TEFAS: "TEFAS",
+    SRC_GOLD: "Altın (ons)",
+    SRC_SILVER: "Gümüş (ons)",
+    SRC_CASH: "Nakit",
+    SRC_MANUAL: "Elle fiyat",
+}
+VAL_LABELS: dict[str, str] = {
+    VAL_QTY: "Adet × Fiyat",
+    VAL_VALUE: "Kova (elle değer)",
+}
+CURRENCIES = ["TRY", "USD", "EUR"]
+
+# Altın/gümüş dışındaki satırlarda "Birim" boş kalır; tabloda "Yok" görünür.
+NO_UNIT = "Yok"
+UNIT_OPTIONS = [NO_UNIT] + list(METAL_UNITS)
+
+EDIT_COLS = ["Sembol", "Fiyat Sembolü", "Kaynak", "Değerleme", "Para Birimi",
+             "Ana Sınıf", "Alt Sınıf", "Sektör", "Hesap", "Birim",
+             "Adet", "Birim Maliyet", "Elle Değer", "Notlar"]
+
+_SRC_REV = {v: k for k, v in SOURCE_LABELS.items()}
+_VAL_REV = {v: k for k, v in VAL_LABELS.items()}
+
+
+def assets_to_editor(items: list[dict[str, Any]]) -> pd.DataFrame:
+    """Varlık listesini düzenlenebilir tabloya çevirir."""
+    return pd.DataFrame([{
+        "Sembol": a.get("display") or a["symbol"],
+        "Fiyat Sembolü": a["symbol"],
+        "Kaynak": SOURCE_LABELS.get(a.get("source", SRC_YAHOO),
+                                    SOURCE_LABELS[SRC_YAHOO]),
+        "Değerleme": VAL_LABELS.get(a.get("valuation", VAL_QTY), VAL_LABELS[VAL_QTY]),
+        "Para Birimi": a.get("currency", "TRY"),
+        "Ana Sınıf": a.get("ana_sinif", "Diğer"),
+        "Alt Sınıf": a.get("alt_sinif", ""),
+        "Sektör": a.get("sektor", ""),
+        "Hesap": a.get("hesap", ""),
+        "Birim": a.get("unit") or NO_UNIT,
+        "Adet": float(a.get("qty") or 0.0),
+        "Birim Maliyet": float(a.get("avg_cost") or 0.0),
+        "Elle Değer": float(a.get("manual_price") or 0.0),
+        "Notlar": a.get("notlar", ""),
+    } for a in items], columns=EDIT_COLS)
+
+
+def editor_to_assets(edited: pd.DataFrame) -> tuple[list[dict[str, Any]], list[str]]:
+    """
+    Düzenlenmiş tabloyu varlık listesine çevirir.
+
+    - Tamamen boş satırlar atlanır (kullanıcı satır ekleyip vazgeçmiş olabilir).
+    - Aynı sembol + hesap ikilisi tekrar ederse ikinci satır alınmaz ve uyarılır;
+      aksi halde sessizce veri kaybı olurdu.
+    - Değerleme moduyla tutarsız satırlar (adet 0 ama canlı mod gibi) rapor edilir.
+    """
+    out: list[dict[str, Any]] = []
+    problems: list[str] = []
+    seen: set[str] = set()
+
+    for pos, (_, row) in enumerate(edited.iterrows(), start=1):
+        sym = str(row.get("Fiyat Sembolü") or "").strip()
+        disp = str(row.get("Sembol") or "").strip()
+        if not sym and not disp:
+            continue
+        if not sym:
+            sym = disp.upper()
+
+        unit_raw = str(row.get("Birim") or "").strip().upper()
+        rec = normalize_asset({
+            "symbol": sym,
+            "display": disp or sym,
+            "source": _SRC_REV.get(str(row.get("Kaynak")), SRC_YAHOO),
+            "valuation": _VAL_REV.get(str(row.get("Değerleme")), VAL_QTY),
+            "currency": str(row.get("Para Birimi") or "TRY").upper(),
+            "ana_sinif": str(row.get("Ana Sınıf") or "Diğer"),
+            "alt_sinif": str(row.get("Alt Sınıf") or "Diğer"),
+            "sektor": str(row.get("Sektör") or "Diğer"),
+            "hesap": str(row.get("Hesap") or "").strip(),
+            "unit": unit_raw if unit_raw in METAL_UNITS else None,
+            "qty": float(row.get("Adet") or 0.0),
+            "avg_cost": float(row.get("Birim Maliyet") or 0.0),
+            "manual_price": float(row.get("Elle Değer") or 0.0) or None,
+            "notlar": str(row.get("Notlar") or ""),
+        })
+
+        key = asset_key(rec)
+        if key in seen:
+            problems.append(
+                f"Satır {pos}: '{rec['symbol']}' + hesap '{rec['hesap']}' ikilisi "
+                f"zaten var; bu satır alınmadı. Ayırmak için 'Hesap' sütununu "
+                f"farklılaştırın.")
+            continue
+        seen.add(key)
+
+        if rec["valuation"] == VAL_QTY and rec["qty"] <= 0:
+            problems.append(f"Satır {pos}: '{rec['display']}' canlı fiyat modunda "
+                            f"ama adedi 0 — değeri sıfır görünecek.")
+        if rec["valuation"] == VAL_VALUE and not rec.get("manual_price"):
+            problems.append(f"Satır {pos}: '{rec['display']}' kova modunda ama "
+                            f"'Elle Değer' boş.")
+        out.append(rec)
+
+    return out, problems
+
+# ==========================================================================
 # KAYNAK: app.py
 # ==========================================================================
 
@@ -1152,14 +1290,9 @@ class _Namespace:
 
 an = px = _Namespace()
 
-"""
-AETHER NEXUS — Canlı portföy takip uygulaması.
-Streamlit üzerinde çalışır, portföyünü GitHub deposunda kalıcı tutar.
-
-Çalıştırma:  streamlit run app.py
-"""
 
 
+import json
 import logging
 
 import pandas as pd
@@ -1173,38 +1306,186 @@ LEVEL_COLS = {"ana_sinif": "Ana Sınıf", "alt_sinif": "Alt Sınıf",
               "sektor": "Sektör", "display": "Sembol",
               "hesap": "Hesap", "currency": "Para Birimi"}
 
-SOURCE_LABELS = {
-    SRC_YAHOO: "Yahoo Finance (hisse / ETF / kripto)",
-    SRC_TEFAS: "TEFAS (yatırım fonu)",
-    SRC_GOLD: "Altın (ons üzerinden türetilir)",
-    SRC_SILVER: "Gümüş (ons üzerinden türetilir)",
-    SRC_CASH: "Nakit (fiyat = 1)",
-    SRC_MANUAL: "Elle girilen fiyat",
-}
+# Varsayılan kırılım: 4 seviye 37 pozisyonda okunamayacak kadar küçük kutular
+# ürettiği için Sektör'ü dışarıda bırakıyoruz — kullanıcı isterse ekler.
+DEFAULT_LEVELS = ["ana_sinif", "alt_sinif", "display"]
 
-st.set_page_config(layout="wide", page_title="AETHER NEXUS", page_icon="🌌")
 
+
+st.set_page_config(layout="wide", page_title="AETHER NEXUS", page_icon="🌌",
+                   initial_sidebar_state="collapsed")
+
+# ---------------------------------------------------------------------------
+# TEMA
+# ---------------------------------------------------------------------------
 st.markdown(
     """
     <style>
-    .stApp { background-color: #050505; color: #e6e6e6; }
-    .metric-card { background: linear-gradient(145deg,#121212 0%,#0a0a0a 100%);
-        padding: 14px 16px; border-radius: 12px; border-left: 4px solid #00f3ff;
-        margin-bottom: 10px; }
-    .metric-title { font-size: .72rem; color: #8a8a8a; text-transform: uppercase;
-        letter-spacing: .08em; }
-    .metric-val { font-size: 1.7rem; font-weight: 700; color: #f2f2f2;
-        line-height: 1.25; }
-    .metric-sub { font-size: .78rem; color: #9a9a9a; }
-    .pos { color: #199e70; } .neg { color: #e66767; }
+    :root {
+      --bg:        #050506;
+      --surface:   #0d0d11;
+      --surface-2: #131319;
+      --line:      #1e1e26;
+      --line-soft: #17171d;
+      --ink:       #ececf1;
+      --ink-2:     #a0a0ab;
+      --ink-3:     #6e6e7a;
+      --accent:    #00e5ff;
+      --pos:       #2fbe86;
+      --neg:       #f0736f;
+    }
+
+    .stApp { background: var(--bg); color: var(--ink); }
+    .block-container { padding-top: 2.2rem; padding-bottom: 3rem; max-width: 1500px; }
+
+    /* Sayılar hizalı okunsun */
+    .stApp, .stApp p, .stApp div, .stApp span,
+    [data-testid="stDataFrame"], [data-testid="stDataEditor"] {
+      font-variant-numeric: tabular-nums;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    /* --- Başlık --- */
+    .nx-brand { display: flex; align-items: baseline; gap: .6rem; }
+    .nx-brand h1 {
+      font-size: 1.55rem; font-weight: 700; letter-spacing: -.02em;
+      margin: 0; color: var(--ink);
+    }
+    .nx-brand .tag {
+      font-size: .62rem; font-weight: 700; letter-spacing: .18em;
+      text-transform: uppercase; color: var(--bg);
+      background: var(--accent); padding: .18rem .45rem; border-radius: 4px;
+    }
+    .nx-meta { color: var(--ink-3); font-size: .8rem; margin-top: .35rem; }
+    .nx-meta b { color: var(--ink-2); font-weight: 600; }
+
+    /* --- KPI kartları --- */
+    .kpi {
+      background: linear-gradient(160deg, var(--surface-2) 0%, var(--surface) 100%);
+      border: 1px solid var(--line);
+      border-radius: 14px; padding: 1rem 1.15rem 1.05rem;
+      position: relative; overflow: hidden; height: 100%;
+    }
+    .kpi::before {
+      content: ""; position: absolute; inset: 0 auto 0 0; width: 3px;
+      background: var(--accent); opacity: .85;
+    }
+    .kpi.pos::before { background: var(--pos); }
+    .kpi.neg::before { background: var(--neg); }
+    .kpi-label {
+      font-size: .66rem; letter-spacing: .13em; text-transform: uppercase;
+      color: var(--ink-3); font-weight: 600; margin-bottom: .5rem;
+    }
+    .kpi-value {
+      font-size: 1.65rem; font-weight: 700; letter-spacing: -.025em;
+      line-height: 1.15; color: var(--ink);
+    }
+    .kpi-sub { font-size: .76rem; color: var(--ink-3); margin-top: .38rem; }
+    .kpi-value.pos, .kpi-sub.pos, .badge.pos { color: var(--pos); }
+    .kpi-value.neg, .kpi-sub.neg, .badge.neg { color: var(--neg); }
+    .badge {
+      display: inline-block; font-size: .72rem; font-weight: 600;
+      padding: .12rem .42rem; border-radius: 5px;
+      background: rgba(255,255,255,.05);
+    }
+    .badge.pos { background: rgba(47,190,134,.13); }
+    .badge.neg { background: rgba(240,115,111,.13); }
+
+    /* --- Bölüm başlığı --- */
+    .nx-section {
+      font-size: .68rem; letter-spacing: .14em; text-transform: uppercase;
+      color: var(--ink-3); font-weight: 600;
+      margin: 1.6rem 0 .7rem; padding-bottom: .45rem;
+      border-bottom: 1px solid var(--line-soft);
+    }
+
+    /* --- Sekmeler --- */
+    .stTabs [data-baseweb="tab-list"] {
+      gap: .15rem; border-bottom: 1px solid var(--line); padding-bottom: 0;
+    }
+    .stTabs [data-baseweb="tab"] {
+      height: 42px; padding: 0 1.05rem; background: transparent;
+      color: var(--ink-3); font-size: .87rem; font-weight: 500;
+      border-radius: 8px 8px 0 0;
+    }
+    .stTabs [aria-selected="true"] {
+      color: var(--ink) !important; background: var(--surface) !important;
+      border-bottom: 2px solid var(--accent) !important;
+    }
+
+    /* --- Tablolar --- */
+    [data-testid="stDataFrame"], [data-testid="stDataEditor"] {
+      border: 1px solid var(--line); border-radius: 12px; overflow: hidden;
+    }
+
+    /* --- Butonlar --- */
+    .stButton > button {
+      border-radius: 9px; border: 1px solid var(--line);
+      font-weight: 600; font-size: .85rem; transition: all .12s ease;
+    }
+    .stButton > button[kind="primary"] {
+      background: var(--accent); color: #04141a; border-color: var(--accent);
+    }
+    .stButton > button[kind="primary"]:hover { filter: brightness(1.08); }
+
+    /* --- Giriş alanları --- */
+    .stTextInput input, .stNumberInput input, .stSelectbox > div > div {
+      background: var(--surface) !important; border-color: var(--line) !important;
+      border-radius: 9px !important;
+    }
+    div[data-testid="stExpander"] {
+      border: 1px solid var(--line); border-radius: 12px; background: var(--surface);
+    }
+    hr { border-color: var(--line-soft); }
+
+    /* Streamlit'in varsayılan kırmızı vurgusunu temaya çek */
+    [data-baseweb="tag"] {
+      background-color: rgba(0,229,255,.13) !important;
+      color: var(--accent) !important;
+      border: 1px solid rgba(0,229,255,.28) !important;
+      border-radius: 7px !important;
+    }
+    [data-baseweb="tag"] span, [data-baseweb="tag"] svg { color: var(--accent) !important; }
+    .stSlider [data-baseweb="slider"] div[role="slider"] { background: var(--accent) !important; }
+    [data-testid="stFileUploaderDropzone"] {
+      background: var(--surface) !important; border: 1px dashed var(--line) !important;
+      border-radius: 12px !important;
+    }
+    a, a:visited { color: var(--accent); }
+    kbd {
+      background: var(--surface-2); border: 1px solid var(--line);
+      border-radius: 5px; padding: .05rem .3rem; font-size: .78rem; color: var(--ink-2);
+    }
+    /* Uyarı / bilgi kutuları */
+    div[data-testid="stAlert"] { border-radius: 11px; border: 1px solid var(--line); }
     </style>
     """,
     unsafe_allow_html=True,
 )
 
+CHART_LAYOUT = dict(
+    paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+    font=dict(color="#a0a0ab", size=12,
+              family='-apple-system, "Segoe UI", Roboto, Inter, sans-serif'),
+    margin=dict(t=8, b=8, l=8, r=8),
+    hoverlabel=dict(bgcolor="#131319", bordercolor="#1e1e26",
+                    font=dict(color="#ececf1", size=12)),
+)
+
+
+def section(title: str) -> None:
+    st.markdown(f"<div class='nx-section'>{title}</div>", unsafe_allow_html=True)
+
+
+def kpi(label: str, value: str, sub: str = "", tone: str = "") -> str:
+    cls = f" {tone}" if tone else ""
+    return (f"<div class='kpi{cls}'><div class='kpi-label'>{label}</div>"
+            f"<div class='kpi-value{cls}'>{value}</div>"
+            f"<div class='kpi-sub{cls}'>{sub}</div></div>")
+
 
 # ---------------------------------------------------------------------------
-# DEPOLAMA
+# DEPOLAMA & FİYAT
 # ---------------------------------------------------------------------------
 @st.cache_resource
 def get_storage() -> Storage:
@@ -1230,12 +1511,8 @@ def save_assets(store: Storage, assets: list[dict], message: str) -> bool:
         return False
 
 
-# ---------------------------------------------------------------------------
-# FİYATLAR
-# ---------------------------------------------------------------------------
 @st.cache_data(ttl=300, show_spinner=False)
 def cached_snapshot(fingerprint: str, assets: list[dict]) -> px.MarketSnapshot:
-    """fingerprint değişince veya 5 dakika geçince yeniden çeker."""
     return px.build_snapshot(assets)
 
 
@@ -1244,212 +1521,280 @@ def snapshot_fingerprint(assets: list[dict]) -> str:
                            for a in assets))
 
 
+def fmt_try(v: float) -> str:
+    return "—" if v != v else f"₺{v:,.0f}"
+
+
 # ---------------------------------------------------------------------------
-# ARAYÜZ
+# BAŞLIK
 # ---------------------------------------------------------------------------
 store = get_storage()
-
 if "assets" not in st.session_state:
     st.session_state.assets = load_assets(store)
 assets: list[dict] = st.session_state.assets
 
-head_l, head_r = st.columns([3, 1])
+head_l, head_r = st.columns([4, 1])
 with head_l:
-    st.markdown("## 🌌 AETHER NEXUS <span style='color:#00f3ff'>LIVE</span>",
-                unsafe_allow_html=True)
+    st.markdown(
+        "<div class='nx-brand'><h1>AETHER NEXUS</h1><span class='tag'>Live</span></div>",
+        unsafe_allow_html=True)
 with head_r:
     if st.button("⚡ Fiyatları Yenile", width="stretch", type="primary"):
         cached_snapshot.clear()
         st.rerun()
 
+with st.spinner("Piyasa verisi çekiliyor…"):
+    snap = (cached_snapshot(snapshot_fingerprint(assets), assets) if assets
+            else px.MarketSnapshot(fetched_at=px._now_istanbul()))
+
+usdtry = snap.usdtry
+meta = [f"Son güncelleme <b>{snap.fetched_at}</b>"]
+meta.append(f"USD/TRY <b>{usdtry:,.2f}</b>" if usdtry else "USD/TRY <b>—</b>")
+if snap.fx.get("EURTRY"):
+    meta.append(f"EUR/TRY <b>{snap.fx['EURTRY']:,.2f}</b>")
+if snap.gold_usd_oz and usdtry:
+    meta.append(f"Gram altın <b>₺{snap.gold_usd_oz / px.TROY_OUNCE_G * usdtry:,.0f}</b>")
+meta.append(f"Kayıt <b>{'GitHub' if store.backend == 'github' else 'yerel'}</b>")
+st.markdown(f"<div class='nx-meta'>{'  ·  '.join(meta)}</div>", unsafe_allow_html=True)
+
 if store.backend == "local":
     st.warning(
         "**Kalıcılık kapalı.** Portföy sadece geçici dosyaya yazılıyor; Streamlit "
         "Cloud uygulamayı uyuttuğunda kayıtlar silinir. Secrets içine `[github]` "
-        "bölümünü ekleyin (token / repo / branch / path).",
-        icon="⚠️",
-    )
-else:
-    st.caption(f"💾 Kalıcı kayıt: {store.describe()}")
-
-with st.spinner("Piyasa verisi çekiliyor…"):
-    snap = cached_snapshot(snapshot_fingerprint(assets), assets) if assets \
-        else px.MarketSnapshot(fetched_at=px._now_istanbul())
-
-usdtry = snap.usdtry
-fx_line = f"USD/TRY {usdtry:,.2f}" if usdtry else "USD/TRY —"
-if snap.gold_usd_oz and usdtry:
-    fx_line += f" · Gram altın ₺{snap.gold_usd_oz / px.TROY_OUNCE_G * usdtry:,.0f}"
-st.caption(f"🔄 Son güncelleme: {snap.fetched_at} · {fx_line}")
-
+        "bölümünü ekleyin.", icon="⚠️")
 for err in snap.errors:
     st.warning(err, icon="⚠️")
 
 df = an.build_dataframe(assets, snap.quotes, snap.fx)
 
-# --- ÖZET METRİKLER --------------------------------------------------------
+# ---------------------------------------------------------------------------
+# KPI ŞERİDİ
+# ---------------------------------------------------------------------------
 if not df.empty:
     t = an.totals(df, usdtry)
-    kz_cls = "pos" if t["kz_try"] >= 0 else "neg"
-    sign = "+" if t["kz_try"] >= 0 else ""
-    usd_txt = f"$ {t['deger_usd']:,.0f}" if usdtry else "kur yok"
+    tone = "pos" if t["kz_try"] >= 0 else "neg"
+    sign = "+" if t["kz_try"] >= 0 else "−"
+    abs_kz = abs(t["kz_try"])
     net_usd = (t["net_try"] / usdtry) if usdtry else float("nan")
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.markdown(
-        f"<div class='metric-card'><div class='metric-title'>Varlık Toplamı</div>"
-        f"<div class='metric-val'>₺ {t['deger_try']:,.0f}</div>"
-        f"<div class='metric-sub'>{usd_txt}</div></div>", unsafe_allow_html=True)
-    c2.markdown(
-        f"<div class='metric-card'><div class='metric-title'>Net Değer "
-        f"(borç düşülmüş)</div>"
-        f"<div class='metric-val'>₺ {t['net_try']:,.0f}</div>"
-        f"<div class='metric-sub'>borç ₺{t['borc_try']:,.0f}"
-        + (f" · $ {net_usd:,.0f}" if usdtry else "") + "</div></div>",
-        unsafe_allow_html=True)
-    c3.markdown(
-        f"<div class='metric-card'><div class='metric-title'>Kâr / Zarar</div>"
-        f"<div class='metric-val {kz_cls}'>{sign}₺ {t['kz_try']:,.0f}</div>"
-        f"<div class='metric-sub {kz_cls}'>{sign}%{t['kz_pct']:.2f} · "
-        f"maliyet ₺{t['maliyet_try']:,.0f}</div></div>",
-        unsafe_allow_html=True)
-    top = df.iloc[0] if len(df) else None
-    if top is not None:
-        c4.markdown(
-            f"<div class='metric-card'><div class='metric-title'>En Büyük Pozisyon</div>"
-            f"<div class='metric-val'>{top['Sembol']}</div>"
-            f"<div class='metric-sub'>portföyün %{top['Ağırlık %']:.1f}'i · "
-            f"{len(df)} pozisyon</div></div>", unsafe_allow_html=True)
+    k1, k2, k3, k4 = st.columns(4)
+    k1.markdown(kpi("Varlık Toplamı", fmt_try(t["deger_try"]),
+                    f"${t['deger_usd']:,.0f}" if usdtry else "kur yok"),
+                unsafe_allow_html=True)
+    k2.markdown(kpi("Net Değer", fmt_try(t["net_try"]),
+                    (f"borç {fmt_try(t['borc_try'])}" if t["borc_try"]
+                     else "borç yok")
+                    + (f"  ·  ${net_usd:,.0f}" if usdtry else "")),
+                unsafe_allow_html=True)
+    k3.markdown(kpi("Kâr / Zarar", f"{sign}₺{abs_kz:,.0f}",
+                    f"<span class='badge {tone}'>{sign}%{abs(t['kz_pct']):.2f}</span>"
+                    f"&nbsp; maliyet {fmt_try(t['maliyet_try'])}", tone),
+                unsafe_allow_html=True)
+    biggest = df.iloc[0]
+    k4.markdown(kpi("En Büyük Pozisyon", str(biggest["Etiket"]),
+                    f"%{biggest['Ağırlık %']:.1f} ağırlık  ·  {len(df)} pozisyon"),
+                unsafe_allow_html=True)
 
     if t["eksik"]:
         st.info(f"{t['eksik']} varlığın fiyatı çekilemedi; bu satırlar toplamlara "
-                f"dahil değil. Ayrıntı için 'Varlıklar' sekmesindeki Hata sütununa "
-                f"bakın.", icon="ℹ️")
+                f"dahil değil.", icon="ℹ️")
 
-# --- SEKMELER --------------------------------------------------------------
-tab_dag, tab_tablo, tab_kova, tab_ekle, tab_ayar = st.tabs(
-    ["📊 Dağılım", "🗃️ Varlıklar", "✏️ Değer Güncelle", "➕ Yeni Varlık", "⚙️ Ayarlar"]
-)
+# ---------------------------------------------------------------------------
+# SEKMELER
+# ---------------------------------------------------------------------------
+tab_dag, tab_duzen, tab_kova, tab_ekle, tab_ayar = st.tabs(
+    ["Dağılım", "Varlıklar", "Değer Güncelle", "Yeni Varlık", "Ayarlar"])
 
 # ============================== DAĞILIM ====================================
 with tab_dag:
     if df.empty or df["Değer (TRY)"].fillna(0).sum() <= 0:
-        st.info("Henüz gösterilecek veri yok. 'Yeni Varlık' sekmesinden "
-                "portföyünüze varlık ekleyin.")
+        st.info("Henüz gösterilecek veri yok. 'Yeni Varlık' sekmesinden başlayın.")
     else:
         levels = st.multiselect(
-            "Kırılım seviyeleri (sırayı değiştirebilirsiniz)",
-            options=list(LEVEL_COLS.values()),
-            default=[LEVEL_COLS[k] for k in HIERARCHY],
-        )
+            "Kırılım seviyeleri", options=list(LEVEL_COLS.values()),
+            default=[LEVEL_COLS[k] for k in DEFAULT_LEVELS],
+            help="Sırayı değiştirebilir, seviye ekleyip çıkarabilirsiniz.")
         if not levels:
             levels = [LEVEL_COLS["ana_sinif"]]
 
-        sk = an.sankey_data(df, levels)
-        fig = go.Figure(go.Sankey(
-            arrangement="snap",
-            node=dict(pad=18, thickness=16,
-                      line=dict(color="#050505", width=2),
-                      label=sk["labels"], color=sk["node_colors"],
-                      customdata=sk["paths"],
-                      hovertemplate="%{customdata}<br>₺%{value:,.0f}<extra></extra>"),
-            link=dict(source=sk["source"], target=sk["target"], value=sk["value"],
-                      color=sk["link_colors"],
-                      hovertemplate="%{source.label} → %{target.label}"
-                                    "<br>₺%{value:,.0f}<extra></extra>"),
+        section("Portföy haritası")
+        tm = an.treemap_data(df, levels)
+        fig_tm = go.Figure(go.Treemap(
+            ids=tm["ids"], labels=tm["labels"], parents=tm["parents"],
+            values=tm["values"], branchvalues="total",
+            marker=dict(colors=tm["colors"], line=dict(color="#050506", width=2),
+                        cornerradius=6),
+            textinfo="label+value+percent parent",
+            texttemplate="<b>%{label}</b><br>₺%{value:,.0f}<br>%{percentParent}",
+            textfont=dict(size=13, color="#ececf1"),
+            hovertemplate="<b>%{id}</b><br>₺%{value:,.0f}"
+                          "<br>Üst grubun %{percentParent} kadarı<extra></extra>",
+            pathbar=dict(visible=True, thickness=22),
         ))
-        fig.update_layout(height=120 + 34 * max(6, len(sk["labels"])),
-                          paper_bgcolor="#050505", font=dict(color="#e6e6e6", size=13),
-                          margin=dict(t=10, b=10, l=10, r=10))
-        st.plotly_chart(fig, width="stretch")
+        fig_tm.update_layout(height=520, **CHART_LAYOUT)
+        st.plotly_chart(fig_tm, width="stretch")
 
-        col_a, col_b = st.columns(2)
-        with col_a:
-            st.markdown("#### Ana sınıf dağılımı")
+        c1, c2 = st.columns([1, 1])
+        with c1:
+            section("Ana sınıf dağılımı")
             alloc = an.allocation(df, LEVEL_COLS["ana_sinif"])
-            cmap = an.color_map(list(alloc[LEVEL_COLS["ana_sinif"]].astype(str)))
+            keys = list(alloc[LEVEL_COLS["ana_sinif"]].astype(str))
+            cmap = an.color_map(keys)
             donut = go.Figure(go.Pie(
-                labels=alloc[LEVEL_COLS["ana_sinif"]], values=alloc["Değer (TRY)"],
-                hole=0.58, sort=False,
-                marker=dict(colors=[cmap[k] for k in alloc[LEVEL_COLS["ana_sinif"]]],
-                            line=dict(color="#050505", width=2)),
-                textinfo="label+percent", textposition="outside",
+                labels=keys, values=alloc["Değer (TRY)"], hole=0.62, sort=False,
+                marker=dict(colors=[cmap[k] for k in keys],
+                            line=dict(color="#050506", width=2)),
+                textinfo="percent", textposition="inside",
+                insidetextfont=dict(size=12, color="#ffffff"),
                 hovertemplate="%{label}<br>₺%{value:,.0f} (%{percent})<extra></extra>",
             ))
-            donut.update_layout(height=380, showlegend=True,
-                                legend=dict(orientation="h", y=-0.12),
-                                paper_bgcolor="#050505",
-                                font=dict(color="#e6e6e6"),
-                                margin=dict(t=10, b=10, l=10, r=10))
+            donut.update_layout(
+                height=380, showlegend=True,
+                legend=dict(orientation="v", x=1.0, y=0.5, xanchor="left",
+                            font=dict(size=12)),
+                annotations=[dict(text=f"<b>{fmt_try(t['deger_try'])}</b>",
+                                  x=0.5, y=0.5, showarrow=False,
+                                  font=dict(size=17, color="#ececf1"))],
+                **CHART_LAYOUT)
             st.plotly_chart(donut, width="stretch")
-        with col_b:
-            st.markdown("#### Pozisyon ağırlıkları")
+        with c2:
+            section("En büyük 15 pozisyon")
             bar_df = df.dropna(subset=["Değer (TRY)"]).head(15).iloc[::-1]
             top_map = an.color_map(list(an.allocation(df, "Ana Sınıf")["Ana Sınıf"]))
             bar = go.Figure(go.Bar(
-                x=bar_df["Değer (TRY)"], y=bar_df["Sembol"], orientation="h",
+                x=bar_df["Değer (TRY)"], y=bar_df["Etiket"], orientation="h",
                 marker=dict(color=[top_map.get(c, an.OTHER_COLOR)
-                                   for c in bar_df["Ana Sınıf"]]),
+                                   for c in bar_df["Ana Sınıf"]],
+                            cornerradius=4),
                 hovertemplate="%{y}<br>₺%{x:,.0f}<extra></extra>",
             ))
-            bar.update_layout(height=380, paper_bgcolor="#050505",
-                              plot_bgcolor="#050505", font=dict(color="#e6e6e6"),
-                              xaxis=dict(gridcolor="#1e1e1e", zeroline=False),
-                              yaxis=dict(gridcolor="#1e1e1e"),
-                              margin=dict(t=10, b=10, l=10, r=10))
+            bar.update_layout(
+                height=380, bargap=0.32,
+                xaxis=dict(gridcolor="#17171d", zeroline=False, showline=False,
+                           tickformat=",.0f"),
+                yaxis=dict(showgrid=False, tickfont=dict(size=11)),
+                **CHART_LAYOUT)
             st.plotly_chart(bar, width="stretch")
 
-        with st.expander("Dağılım tabloları"):
-            for key in ("ana_sinif", "alt_sinif", "sektor"):
-                st.markdown(f"**{HIERARCHY_LABELS[key]}**")
-                st.dataframe(an.allocation(df, LEVEL_COLS[key]),
-                             width="stretch", hide_index=True)
+        with st.expander("Akış diyagramı (Sankey)"):
+            sk = an.sankey_data(df, levels)
+            fig_sk = go.Figure(go.Sankey(
+                arrangement="snap",
+                node=dict(pad=16, thickness=14, line=dict(color="#050506", width=1),
+                          label=sk["labels"], color=sk["node_colors"],
+                          customdata=sk["paths"],
+                          hovertemplate="%{customdata}<br>₺%{value:,.0f}<extra></extra>"),
+                link=dict(source=sk["source"], target=sk["target"], value=sk["value"],
+                          color=sk["link_colors"],
+                          hovertemplate="%{source.label} → %{target.label}"
+                                        "<br>₺%{value:,.0f}<extra></extra>"),
+            ))
+            fig_sk.update_layout(height=110 + 30 * max(6, len(sk["labels"])),
+                                 **CHART_LAYOUT)
+            st.plotly_chart(fig_sk, width="stretch")
 
-# ============================== VARLIKLAR ==================================
-with tab_tablo:
-    if df.empty:
-        st.info("Portföy boş.")
-    else:
-        show = df[["Sembol", "Ana Sınıf", "Alt Sınıf", "Sektör", "Değerleme",
-                   "Para Birimi", "Adet", "Maliyet", "Fiyat", "K/Z %",
-                   "Değer (TRY)", "Ağırlık %", "Hata"]]
+        with st.expander("Dağılım tabloları"):
+            for lvl in levels:
+                st.markdown(f"**{lvl}**")
+                st.dataframe(an.allocation(df, lvl), width="stretch",
+                             hide_index=True,
+                             column_config={"Değer (TRY)": st.column_config.NumberColumn(
+                                 format="%.0f"),
+                                 "Pay %": st.column_config.NumberColumn(format="%.2f%%")})
+
+# ======================= VARLIKLAR (TAM DÜZENLEME) ==========================
+with tab_duzen:
+    st.markdown(
+        "Tablodaki her alanı doğrudan düzenleyebilirsiniz. **Satır eklemek** için "
+        "en alttaki boş satırı doldurun, **silmek** için satırın solundaki kutuyu "
+        "işaretleyip <kbd>Delete</kbd> tuşuna basın. Değişiklikler *Kaydet*'e "
+        "basana kadar yazılmaz.",
+        unsafe_allow_html=True)
+
+    if "editor_version" not in st.session_state:
+        st.session_state.editor_version = 0
+
+    edited = st.data_editor(
+        assets_to_editor(assets),
+        width="stretch", hide_index=True, num_rows="dynamic",
+        key=f"asset_editor_{st.session_state.editor_version}",
+        column_config={
+            "Sembol": st.column_config.TextColumn(
+                width="small", help="Ekranda görünen ad"),
+            "Fiyat Sembolü": st.column_config.TextColumn(
+                width="small", help="Kaynaktaki tam sembol: THYAO.IS, BTC-USD, MAC"),
+            "Kaynak": st.column_config.SelectboxColumn(
+                options=list(SOURCE_LABELS.values()), width="small", required=True),
+            "Değerleme": st.column_config.SelectboxColumn(
+                options=list(VAL_LABELS.values()), width="small", required=True,
+                help="Adet × Fiyat = canlı; Kova = elle girdiğiniz toplam tutar"),
+            "Para Birimi": st.column_config.SelectboxColumn(
+                options=CURRENCIES, width="small", required=True),
+            "Ana Sınıf": st.column_config.SelectboxColumn(
+                options=ANA_SINIFLAR, width="small", required=True),
+            "Alt Sınıf": st.column_config.TextColumn(width="small"),
+            "Sektör": st.column_config.TextColumn(width="small"),
+            "Hesap": st.column_config.TextColumn(
+                width="small", help="Aynı sembol farklı kurumdaysa burayı doldurun"),
+            "Birim": st.column_config.SelectboxColumn(
+                options=UNIT_OPTIONS, width="small",
+                help="Sadece altın/gümüş için; diğerlerinde 'Yok'"),
+            "Adet": st.column_config.NumberColumn(format="%.4f", min_value=0.0),
+            "Birim Maliyet": st.column_config.NumberColumn(
+                format="%.2f", min_value=0.0,
+                help="Canlı modda birim maliyet, kova modunda toplam maliyet"),
+            "Elle Değer": st.column_config.NumberColumn(
+                format="%.2f", min_value=0.0,
+                help="Kova modunda kullanılan güncel toplam tutar"),
+            "Notlar": st.column_config.TextColumn(width="medium"),
+        },
+    )
+
+    b1, b2, b3 = st.columns([1, 1, 3])
+    if b1.button("💾 Kaydet", type="primary", width="stretch"):
+        new_assets, problems = editor_to_assets(edited)
+        removed = len(assets) - len(new_assets)
+        for p in problems:
+            st.warning(p, icon="⚠️")
+        st.session_state.assets = new_assets
+        msg = f"portföy düzenlendi ({len(new_assets)} pozisyon)"
+        if save_assets(store, new_assets, msg):
+            cached_snapshot.clear()
+            st.success(f"{len(new_assets)} pozisyon kaydedildi"
+                       + (f", {removed} satır silindi." if removed > 0 else "."))
+            st.rerun()
+    if b2.button("↩️ Değişiklikleri geri al", width="stretch"):
+        st.session_state.editor_version += 1
+        st.rerun()
+
+    if not df.empty:
+        section("Hesaplanmış görünüm")
+        view = df[["Sembol", "Ana Sınıf", "Alt Sınıf", "Sektör", "Değerleme",
+                   "Para Birimi", "Adet", "Fiyat", "K/Z %", "Değer (TRY)",
+                   "Ağırlık %", "Hata"]]
         st.dataframe(
-            show, width="stretch", hide_index=True,
+            view, width="stretch", hide_index=True,
             column_config={
                 "Adet": st.column_config.NumberColumn(format="%.4f"),
-                "Maliyet": st.column_config.NumberColumn(format="%.4f"),
                 "Fiyat": st.column_config.NumberColumn(format="%.4f"),
                 "K/Z %": st.column_config.NumberColumn(format="%.2f%%"),
                 "Değer (TRY)": st.column_config.NumberColumn(format="%.0f"),
                 "Ağırlık %": st.column_config.ProgressColumn(
                     format="%.1f%%", min_value=0.0,
                     max_value=float(df["Ağırlık %"].max(skipna=True) or 100)),
-            },
-        )
-        st.download_button("⬇️ CSV indir", show.to_csv(index=False).encode("utf-8-sig"),
+            })
+        st.download_button("⬇️ CSV indir",
+                           view.to_csv(index=False).encode("utf-8-sig"),
                            "portfoy.csv", "text/csv")
-
-        st.markdown("#### Pozisyon sil")
-        del_key = st.selectbox(
-            "Silinecek pozisyon", options=[asset_key(a) for a in assets],
-            format_func=lambda k: k.replace("|", "  ·  ").rstrip(" ·"),
-            index=None, placeholder="Seçin…",
-        )
-        if del_key and st.button("🗑️ Sil", type="secondary"):
-            st.session_state.assets = [a for a in assets if asset_key(a) != del_key]
-            if save_assets(store, st.session_state.assets, f"sil: {del_key}"):
-                cached_snapshot.clear()
-                st.success("Pozisyon silindi.")
-                st.rerun()
 
 # ========================== DEĞER GÜNCELLE (KOVA) ==========================
 with tab_kova:
     st.markdown(
-        "Bluecoins'teki **Adjustment** mantığının karşılığı. Bu satırların değeri "
-        "elle girdiğiniz toplam tutardır. **Adet sütununa sıfırdan büyük bir sayı "
-        "yazdığınız anda** o satır kalıcı olarak *Adet × canlı fiyat* moduna geçer "
-        "ve bir daha elle güncelleme gerektirmez."
-    )
+        "Canlı fiyatı olmayan kovaların (aracı kurum bakiyesi, gayrimenkul, "
+        "alacak…) güncel değerini buradan girin. **Adet** hücresine sıfırdan "
+        "büyük bir sayı yazıp kaydederseniz o satır kalıcı olarak canlı "
+        "fiyatlamaya geçer.")
+
     kova_rows = [a for a in assets if a.get("valuation") == VAL_VALUE]
     if not kova_rows:
         st.info("Elle değerlenen pozisyon yok — her şey canlı fiyatla hesaplanıyor.")
@@ -1458,60 +1803,53 @@ with tab_kova:
         edit_df = pd.DataFrame([{
             "Pozisyon": a.get("display") or a["symbol"],
             "Ana Sınıf": a.get("ana_sinif", ""),
-            "Kaynak": a.get("source", ""),
             "Sembol": a["symbol"],
-            "Canlı Birim Fiyat": (getattr(live.get(a["symbol"]), "price", None)
-                                  if getattr(live.get(a["symbol"]), "ok", False)
-                                  else None),
+            # Kaynağı "elle fiyat" olan satırda canlı fiyat yoktur; oraya
+            # kovanın kendi tutarını yazmak kafa karıştırıcı olurdu.
+            "Canlı Birim Fiyat": (
+                getattr(live.get(a["symbol"]), "price", None)
+                if (a.get("source") not in (SRC_MANUAL, SRC_CASH)
+                    and getattr(live.get(a["symbol"]), "ok", False))
+                else None),
             "Para Birimi": a.get("currency", "TRY"),
             "Güncel Değer": float(a.get("manual_price") or 0.0),
-            "Maliyet": float(a.get("avg_cost") or 0.0),
+            "Toplam Maliyet": float(a.get("avg_cost") or 0.0),
             "Adet": float(a.get("qty") or 0.0),
             "_key": asset_key(a),
         } for a in kova_rows])
 
-        edited = st.data_editor(
+        kova_edited = st.data_editor(
             edit_df, width="stretch", hide_index=True, num_rows="fixed",
-            disabled=["Pozisyon", "Ana Sınıf", "Kaynak", "Sembol",
-                      "Canlı Birim Fiyat", "Para Birimi", "_key"],
+            disabled=["Pozisyon", "Ana Sınıf", "Sembol", "Canlı Birim Fiyat",
+                      "Para Birimi", "_key"],
             column_config={
                 "_key": None,
-                "Canlı Birim Fiyat": st.column_config.NumberColumn(
-                    format="%.4f",
-                    help="Bu kaynağın şu anki birim fiyatı. Adedi buradan "
-                         "hesaplayabilirsiniz: değer ÷ birim fiyat."),
+                "Canlı Birim Fiyat": st.column_config.NumberColumn(format="%.4f"),
                 "Güncel Değer": st.column_config.NumberColumn(
-                    format="%.2f", min_value=0.0, help="Kovanın toplam güncel tutarı"),
-                "Maliyet": st.column_config.NumberColumn(
-                    format="%.2f", min_value=0.0,
-                    help="Bu kovaya koyduğunuz toplam para (K/Z bundan hesaplanır)"),
-                "Adet": st.column_config.NumberColumn(
-                    format="%.4f", min_value=0.0,
-                    help="Doldurursanız satır canlı fiyatlamaya geçer"),
+                    format="%.2f", min_value=0.0),
+                "Toplam Maliyet": st.column_config.NumberColumn(
+                    format="%.2f", min_value=0.0),
+                "Adet": st.column_config.NumberColumn(format="%.4f", min_value=0.0),
             },
-            key="kova_editor",
-        )
+            key="kova_editor")
 
         st.caption("İpucu: Adet ≈ Güncel Değer ÷ Canlı Birim Fiyat")
 
-        if st.button("💾 Kaydet", type="primary", width="stretch"):
-            by_key = {r["_key"]: r for _, r in edited.iterrows()}
+        if st.button("💾 Kaydet", type="primary", width="stretch", key="kova_save"):
+            by_key = {r["_key"]: r for _, r in kova_edited.iterrows()}
             changed, promoted = 0, []
             for a in st.session_state.assets:
                 row = by_key.get(asset_key(a))
                 if row is None:
                     continue
                 new_val = float(row["Güncel Değer"])
-                new_cost = float(row["Maliyet"])
+                new_cost = float(row["Toplam Maliyet"])
                 new_qty = float(row["Adet"] or 0.0)
                 touched = False
-
                 if new_qty > 0 and a.get("source") != SRC_MANUAL:
-                    # Kovadan gerçek pozisyona terfi: toplam maliyeti birim
-                    # maliyete çevir ki K/Z tutarlı kalsın.
                     a["valuation"] = VAL_QTY
                     a["qty"] = new_qty
-                    a["avg_cost"] = (new_cost / new_qty) if new_qty else 0.0
+                    a["avg_cost"] = new_cost / new_qty if new_qty else 0.0
                     a["manual_price"] = None
                     promoted.append(a.get("display") or a["symbol"])
                     touched = True
@@ -1520,7 +1858,6 @@ with tab_kova:
                     a["manual_price"] = new_val
                     a["avg_cost"] = new_cost
                     touched = True
-
                 changed += int(touched)
 
             if not changed:
@@ -1533,11 +1870,12 @@ with tab_kova:
                 st.success(f"{changed} pozisyon kaydedildi.")
                 st.rerun()
 
-
-# ============================== EKLE =======================================
+# ============================== YENİ VARLIK ================================
 with tab_ekle:
-    st.markdown("#### 1) Sembolü girin — kalan alanlar otomatik dolar")
-    sym_in = st.text_input("Sembol / Kod", placeholder="ALKA, NVDA, MAC, BTC, ALTIN-CEYREK, NAKIT-USD")
+    st.markdown("Sembolü yazın — sınıf, para birimi ve fiyat kaynağı otomatik dolar.")
+    sym_in = st.text_input(
+        "Sembol / Kod", placeholder="ALKA · NVDA · MAC · BTC · ALTIN-CEYREK · NAKIT-USD",
+        label_visibility="collapsed")
 
     if sym_in.strip():
         try:
@@ -1548,37 +1886,39 @@ with tab_ekle:
 
         if guess:
             if guess["guessed"]:
-                st.info("Bu sembol veritabanında yok; tahmin edildi. Aşağıdaki "
-                        "alanları kontrol edin.", icon="🔎")
+                st.info("Bu sembol veritabanında yok; tahmin edildi. Alanları "
+                        "kontrol edin.", icon="🔎")
             else:
-                st.success(f"Tanındı: {guess['ana_sinif']} · {guess['alt_sinif']} "
+                st.success(f"Tanındı — {guess['ana_sinif']} · {guess['alt_sinif']} "
                            f"· {guess['sektor']}", icon="✅")
 
             with st.form("add_form"):
-                r1c1, r1c2, r1c3 = st.columns(3)
-                symbol = r1c1.text_input("Fiyat sembolü", guess["symbol"],
-                                         help="Yahoo için tam sembol (THYAO.IS, BTC-USD)")
-                source = r1c2.selectbox(
+                r1 = st.columns(3)
+                symbol = r1[0].text_input("Fiyat sembolü", guess["symbol"])
+                source = r1[1].selectbox(
                     "Fiyat kaynağı", list(SOURCE_LABELS),
                     index=list(SOURCE_LABELS).index(guess["source"]),
                     format_func=lambda s: SOURCE_LABELS[s])
-                currency = r1c3.selectbox("Para birimi", ["TRY", "USD", "EUR"],
-                                          index=["TRY", "USD", "EUR"].index(guess["currency"]))
+                currency = r1[2].selectbox(
+                    "Para birimi", CURRENCIES,
+                    index=CURRENCIES.index(guess["currency"])
+                    if guess["currency"] in CURRENCIES else 0)
 
-                r2c1, r2c2, r2c3 = st.columns(3)
-                ana = r2c1.selectbox(
+                r2 = st.columns(3)
+                ana = r2[0].selectbox(
                     "Ana sınıf", ANA_SINIFLAR,
                     index=ANA_SINIFLAR.index(guess["ana_sinif"])
                     if guess["ana_sinif"] in ANA_SINIFLAR else len(ANA_SINIFLAR) - 1)
-                alt = r2c2.text_input("Alt sınıf", guess["alt_sinif"])
-                sektor = r2c3.text_input("Sektör", guess["sektor"])
+                alt = r2[1].text_input("Alt sınıf", guess["alt_sinif"])
+                sektor = r2[2].text_input("Sektör", guess["sektor"])
 
-                r3c1, r3c2, r3c3 = st.columns(3)
-                qty = r3c1.number_input("Adet / Gram", min_value=0.0, value=0.0,
-                                        step=1.0, format="%.4f")
-                cost = r3c2.number_input("Birim maliyet", min_value=0.0, value=0.0,
-                                         step=0.01, format="%.4f")
-                hesap = r3c3.text_input("Hesap / Kurum (opsiyonel)", guess.get("hesap", ""))
+                r3 = st.columns(3)
+                qty = r3[0].number_input("Adet / Gram", min_value=0.0, value=0.0,
+                                         step=1.0, format="%.4f")
+                cost = r3[1].number_input("Birim maliyet", min_value=0.0, value=0.0,
+                                          step=0.01, format="%.4f")
+                hesap = r3[2].text_input("Hesap / Kurum", guess.get("hesap", ""),
+                                         placeholder="Midas, VB, YK…")
 
                 unit = None
                 manual_price = None
@@ -1586,24 +1926,26 @@ with tab_ekle:
                     units = list(METAL_UNITS)
                     cur_unit = (guess.get("unit") or "GRAM").upper()
                     unit = st.selectbox("Birim", units,
-                                        index=units.index(cur_unit) if cur_unit in units else 0)
+                                        index=units.index(cur_unit)
+                                        if cur_unit in units else 0)
                 if source == SRC_MANUAL:
-                    manual_price = st.number_input("Güncel fiyat (elle)",
-                                                   min_value=0.0, value=0.0, format="%.4f")
+                    manual_price = st.number_input("Güncel toplam değer",
+                                                   min_value=0.0, value=0.0,
+                                                   format="%.2f")
 
                 mode = st.radio(
                     "Bu pozisyon zaten varsa", ["add", "replace"], horizontal=True,
-                    format_func=lambda m: "Üzerine ekle (ortalama maliyeti güncelle)"
+                    format_func=lambda m: "Üzerine ekle (ortalama maliyet güncellenir)"
                     if m == "add" else "Tamamen değiştir")
 
-                submitted = st.form_submit_button("🚀 Portföye kaydet",
-                                                  width="stretch")
+                submitted = st.form_submit_button("Portföye kaydet", width="stretch",
+                                                  type="primary")
 
             if submitted:
-                if qty <= 0:
+                if qty <= 0 and source != SRC_MANUAL:
                     st.error("Adet sıfırdan büyük olmalı.")
                 else:
-                    record = {
+                    record = normalize_asset({
                         "symbol": symbol.strip(),
                         "display": (guess["display"] or symbol).strip().upper(),
                         "source": source, "currency": currency,
@@ -1613,45 +1955,50 @@ with tab_ekle:
                         "hesap": hesap.strip(), "unit": unit,
                         "manual_price": manual_price, "notlar": "",
                         "valuation": VAL_VALUE if source == SRC_MANUAL else VAL_QTY,
-                    }
+                    })
                     st.session_state.assets = an.merge_position(
                         st.session_state.assets, record, mode=mode)
                     if save_assets(store, st.session_state.assets,
-                                   f"portföy: {record['display']} güncellendi"):
+                                   f"portföy: {record['display']} eklendi"):
                         cached_snapshot.clear()
                         st.success(f"{record['display']} kaydedildi.")
                         st.rerun()
 
 # ============================== AYARLAR ====================================
 with tab_ayar:
-    st.markdown("#### Depolama durumu")
+    section("Depolama")
     st.code(store.describe(), language="text")
     if store.backend == "local":
         st.markdown(
-            "Kalıcı kayıt için Streamlit **Settings → Secrets** alanına:\n\n"
+            "Kalıcı kayıt için Streamlit **Settings → Secrets**:\n\n"
             "```toml\n[github]\ntoken  = \"github_pat_...\"\n"
             "repo   = \"kullanici/depo\"\nbranch = \"main\"\n"
-            "path   = \"my_assets.json\"\n```"
-        )
+            "path   = \"my_assets.json\"\n```")
 
-    st.markdown("#### Fiyat kaynakları")
+    section("Fiyat kaynağı durumu")
     if not df.empty:
-        st.dataframe(
-            df[["Sembol", "Yahoo Sembol", "Kaynak", "Fiyat", "Fiyat OK", "Hata"]],
-            width="stretch", hide_index=True)
+        diag = df[["Sembol", "Yahoo Sembol", "Kaynak", "Değerleme", "Fiyat",
+                   "Fiyat OK", "Hata"]]
+        st.dataframe(diag, width="stretch", hide_index=True,
+                     column_config={"Fiyat": st.column_config.NumberColumn(
+                         format="%.4f")})
 
-    st.markdown("#### Yedek")
-    import json as _json
-    st.download_button("⬇️ my_assets.json indir",
-                       _json.dumps(assets, indent=2, ensure_ascii=False).encode("utf-8"),
-                       "my_assets.json", "application/json")
-    up = st.file_uploader("Yedekten yükle (mevcut portföyün üzerine yazar)", type="json")
+    section("Yedek")
+    y1, y2 = st.columns(2)
+    y1.download_button(
+        "⬇️ my_assets.json indir",
+        json.dumps(assets, indent=2, ensure_ascii=False).encode("utf-8"),
+        "my_assets.json", "application/json", width="stretch")
+    up = y2.file_uploader("Yedekten yükle (mevcut portföyün üzerine yazar)",
+                          type="json")
     if up is not None and st.button("📥 Yüklemeyi uygula"):
         try:
-            data = _json.loads(up.getvalue().decode("utf-8"))
+            data = json.loads(up.getvalue().decode("utf-8"))
             st.session_state.assets = [normalize_asset(a) for a in data]
             if save_assets(store, st.session_state.assets, "yedekten geri yükleme"):
                 cached_snapshot.clear()
+                st.session_state.editor_version = \
+                    st.session_state.get("editor_version", 0) + 1
                 st.success("Yedek yüklendi.")
                 st.rerun()
         except Exception as exc:

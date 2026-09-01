@@ -1,11 +1,1164 @@
 """
+AETHER NEXUS — Canlı portföy takip uygulaması (TEK DOSYA SÜRÜMÜ)
+
+Bu dosya build_single_file.py tarafından üretilmiştir; elle düzenlemeyin.
+Kaynak: portfolio/classification.py, prices.py, storage.py, analytics.py, app.py
+
+Çalıştırma:  streamlit run aether_nexus.py
+"""
+
+from __future__ import annotations
+
+
+# ==========================================================================
+# KAYNAK: portfolio/classification.py
+# ==========================================================================
+"""
+Varlık sınıflandırma ve otomatik tanıma motoru.
+
+TASARIM KARARI (önemli):
+  - "source"  = fiyatın NEREDEN çekileceği (teknik)
+  - "ana_sinif / alt_sinif / sektor" = varlığın NASIL gruplanacağı (sunum)
+Bu ikisi ayrıdır. Eski kodda tek bir "type" alanı her iki işi birden yapıyordu,
+bu yüzden sınıflandırmayı değiştirmek fiyat çekmeyi bozuyordu.
+
+Sınıflandırma hiyerarşisini değiştirmek için sadece HIERARCHY ve
+SMART_DATABASE'i düzenleyin; başka hiçbir dosyaya dokunmanız gerekmez.
+"""
+
+
+import re
+from typing import Any
+
+# --------------------------------------------------------------------------
+# FİYAT KAYNAKLARI (teknik)
+# --------------------------------------------------------------------------
+SRC_YAHOO = "yahoo"          # yfinance ile çekilir
+SRC_TEFAS = "tefas"          # TEFAS BindHistoryInfo API
+SRC_GOLD = "gold"            # XAU/USD üzerinden türetilir
+SRC_SILVER = "silver"        # XAG/USD üzerinden türetilir
+SRC_CASH = "cash"            # nakit, fiyatı her zaman 1.0
+SRC_MANUAL = "manual"        # elle girilen fiyat (borsada işlem görmeyen varlık)
+
+VALID_SOURCES = {SRC_YAHOO, SRC_TEFAS, SRC_GOLD, SRC_SILVER, SRC_CASH, SRC_MANUAL}
+
+# --------------------------------------------------------------------------
+# SINIFLANDIRMA HİYERARŞİSİ
+# Sankey / Sunburst bu sırayla çizilir. Sıralamayı değiştirebilir,
+# seviye ekleyip çıkarabilirsiniz (ör. "hesap" ekleyip broker kırılımı almak).
+# --------------------------------------------------------------------------
+HIERARCHY = ["ana_sinif", "alt_sinif", "sektor", "display"]
+
+HIERARCHY_LABELS = {
+    "ana_sinif": "Ana Sınıf",
+    "alt_sinif": "Alt Sınıf",
+    "sektor": "Sektör",
+    "display": "Varlık",
+    "hesap": "Hesap / Kurum",
+    "currency": "Para Birimi",
+}
+
+# Ana sınıf listesi — arayüzdeki açılır menüleri besler.
+# Bluecoins hesap ağacınızdan türetildi (01_BIST … 08_CRYPTO + gizli hesaplar).
+ANA_SINIFLAR = [
+    "Hisse Senedi",     # 01_BIST, 02_US Stocks
+    "Fon",              # 03_Fon
+    "Emtia",            # 04A_Gold, 04B_SILVER
+    "Kripto",           # 08_CRYPTO
+    "Sabit Getirili",   # 05_Eurobond
+    "Nakit",            # 06_$/€ Cash, 07_₺ Cash, Bank
+    "Gayrimenkul",      # Properties
+    "Alacaklar",        # Receivables (OYAK, BES)
+    "Yükümlülük",       # Credit Card, Mortgages, Virtual Accounts
+    "Diğer",            # Other Assets (taşıt, karavan)
+]
+
+# Net değer hesabında değeri NEGATİF sayılacak sınıflar.
+BORC_SINIFLARI = {"Yükümlülük"}
+
+# Altın/gümüş birim çarpanları (1 birim kaç gram saf metale denk).
+# Fiyatlar gram saf metal üzerinden hesaplanır, işçilik/makas payı dahil değildir.
+METAL_UNITS = {
+    "GRAM": 1.0,
+    "ONS": 31.1034768,
+    "CEYREK": 1.6042,      # 1.75 g / 22 ayar (0.916) ≈ 1.6042 g saf
+    "YARIM": 3.2084,
+    "TAM": 6.4168,
+    "CUMHURIYET": 6.6165,
+    "ATA": 6.6165,
+    "RESAT": 7.0160,
+    "BILEZIK22": 0.916,    # 1 gram 22 ayar bilezik
+    "BILEZIK14": 0.585,
+}
+
+# --------------------------------------------------------------------------
+# BİLİNEN VARLIKLAR
+# Buraya eklediğiniz her sembol, ekleme ekranında otomatik dolar.
+# --------------------------------------------------------------------------
+def _s(sektor: str, **kw: Any) -> dict[str, Any]:
+    return {"sektor": sektor, **kw}
+
+
+SMART_DATABASE: dict[str, dict[str, Any]] = {}
+
+
+def _reg(codes: str, *, source: str, currency: str, ana: str, alt: str,
+         sektor: str, suffix: str = "") -> None:
+    """Toplu kayıt yardımcısı."""
+    for code in codes.split():
+        SMART_DATABASE[code] = {
+            "source": source,
+            "currency": currency,
+            "ana_sinif": ana,
+            "alt_sinif": alt,
+            "sektor": sektor,
+            "yahoo_suffix": suffix,
+        }
+
+
+# --- BIST hisseleri ---------------------------------------------------------
+_reg("THYAO PGSUS TAVHL", source=SRC_YAHOO, currency="TRY",
+     ana="Hisse Senedi", alt="BIST", sektor="Havacılık", suffix=".IS")
+_reg("TUPRS AKSEN ZOREN ENJSA AYDEM", source=SRC_YAHOO, currency="TRY",
+     ana="Hisse Senedi", alt="BIST", sektor="Enerji", suffix=".IS")
+_reg("EREGL KRDMD ISDMR CEMTS", source=SRC_YAHOO, currency="TRY",
+     ana="Hisse Senedi", alt="BIST", sektor="Demir-Çelik", suffix=".IS")
+_reg("ASELS OTKAR KATMR", source=SRC_YAHOO, currency="TRY",
+     ana="Hisse Senedi", alt="BIST", sektor="Savunma Sanayi", suffix=".IS")
+_reg("ALKA KARTN SASA PETKM GUBRF HEKTS", source=SRC_YAHOO, currency="TRY",
+     ana="Hisse Senedi", alt="BIST", sektor="Kimya / Kağıt", suffix=".IS")
+_reg("GARAN AKBNK ISCTR YKBNK VAKBN HALKB TSKB", source=SRC_YAHOO, currency="TRY",
+     ana="Hisse Senedi", alt="BIST", sektor="Bankacılık", suffix=".IS")
+_reg("BIMAS MGROS SOKM ULKER CCOLA AEFES", source=SRC_YAHOO, currency="TRY",
+     ana="Hisse Senedi", alt="BIST", sektor="Perakende / Gıda", suffix=".IS")
+_reg("TCELL TTKOM LOGO ARDYZ NETAS", source=SRC_YAHOO, currency="TRY",
+     ana="Hisse Senedi", alt="BIST", sektor="Teknoloji / Telekom", suffix=".IS")
+_reg("FROTO TOASO TTRAK DOAS", source=SRC_YAHOO, currency="TRY",
+     ana="Hisse Senedi", alt="BIST", sektor="Otomotiv", suffix=".IS")
+_reg("KCHOL SAHOL SISE AGHOL", source=SRC_YAHOO, currency="TRY",
+     ana="Hisse Senedi", alt="BIST", sektor="Holding", suffix=".IS")
+_reg("ASTOR ENKAI TKFEN", source=SRC_YAHOO, currency="TRY",
+     ana="Hisse Senedi", alt="BIST", sektor="Sanayi / Taahhüt", suffix=".IS")
+
+# --- ABD hisseleri ----------------------------------------------------------
+_reg("NVDA AMD AVGO INTC TSM MU ASML", source=SRC_YAHOO, currency="USD",
+     ana="Hisse Senedi", alt="ABD", sektor="Yarı İletken")
+_reg("AAPL MSFT GOOGL META AMZN CRM ADBE ORCL PLTR", source=SRC_YAHOO, currency="USD",
+     ana="Hisse Senedi", alt="ABD", sektor="Teknoloji")
+_reg("TSLA RIVN F GM", source=SRC_YAHOO, currency="USD",
+     ana="Hisse Senedi", alt="ABD", sektor="Otomotiv / EV")
+_reg("JPM BAC GS V MA", source=SRC_YAHOO, currency="USD",
+     ana="Hisse Senedi", alt="ABD", sektor="Finans")
+_reg("LLY UNH JNJ PFE NVO", source=SRC_YAHOO, currency="USD",
+     ana="Hisse Senedi", alt="ABD", sektor="Sağlık")
+_reg("XOM CVX OXY", source=SRC_YAHOO, currency="USD",
+     ana="Hisse Senedi", alt="ABD", sektor="Enerji")
+
+# --- ETF'ler ----------------------------------------------------------------
+_reg("QQQ QQQM", source=SRC_YAHOO, currency="USD",
+     ana="Fon", alt="ABD ETF", sektor="Teknoloji Endeksi")
+_reg("SPY VOO IVV VTI", source=SRC_YAHOO, currency="USD",
+     ana="Fon", alt="ABD ETF", sektor="Geniş Endeks")
+_reg("XLU", source=SRC_YAHOO, currency="USD",
+     ana="Fon", alt="ABD ETF", sektor="Altyapı / Kamu Hizmetleri")
+_reg("XLE XLF XLV XLK SMH SOXX", source=SRC_YAHOO, currency="USD",
+     ana="Fon", alt="ABD ETF", sektor="Sektör ETF")
+_reg("GLD IAU SLV", source=SRC_YAHOO, currency="USD",
+     ana="Fon", alt="ABD ETF", sektor="Kıymetli Maden ETF")
+_reg("TLT IEF SHY", source=SRC_YAHOO, currency="USD",
+     ana="Sabit Getirili", alt="ABD ETF", sektor="Tahvil ETF")
+
+# --- Kripto -----------------------------------------------------------------
+_reg("BTC ETH", source=SRC_YAHOO, currency="USD",
+     ana="Kripto", alt="Majör", sektor="L1 Zincir", suffix="-USD")
+_reg("SOL AVAX ADA DOT ATOM NEAR SUI APT TON", source=SRC_YAHOO, currency="USD",
+     ana="Kripto", alt="Altcoin", sektor="L1 Zincir", suffix="-USD")
+_reg("ARB OP MATIC", source=SRC_YAHOO, currency="USD",
+     ana="Kripto", alt="Altcoin", sektor="L2 / Ölçekleme", suffix="-USD")
+_reg("LINK UNI AAVE", source=SRC_YAHOO, currency="USD",
+     ana="Kripto", alt="Altcoin", sektor="DeFi / Oracle", suffix="-USD")
+_reg("USDT USDC", source=SRC_YAHOO, currency="USD",
+     ana="Nakit", alt="Stablecoin", sektor="Dolar Stablecoin", suffix="-USD")
+
+# --- Emtia (türetilmiş) -----------------------------------------------------
+SMART_DATABASE["ALTIN"] = {
+    "source": SRC_GOLD, "currency": "TRY", "ana_sinif": "Emtia",
+    "alt_sinif": "Kıymetli Maden", "sektor": "Altın", "unit": "GRAM",
+}
+SMART_DATABASE["GUMUS"] = {
+    "source": SRC_SILVER, "currency": "TRY", "ana_sinif": "Emtia",
+    "alt_sinif": "Kıymetli Maden", "sektor": "Gümüş", "unit": "GRAM",
+}
+for _u in ("CEYREK", "YARIM", "TAM", "CUMHURIYET", "ATA", "RESAT",
+           "BILEZIK22", "BILEZIK14", "ONS"):
+    SMART_DATABASE[f"ALTIN-{_u}"] = {
+        "source": SRC_GOLD, "currency": "TRY", "ana_sinif": "Emtia",
+        "alt_sinif": "Kıymetli Maden", "sektor": "Altın", "unit": _u,
+    }
+SMART_DATABASE["GUMUS-ONS"] = {
+    "source": SRC_SILVER, "currency": "USD", "ana_sinif": "Emtia",
+    "alt_sinif": "Kıymetli Maden", "sektor": "Gümüş", "unit": "ONS",
+}
+
+# --- Nakit ------------------------------------------------------------------
+for _cur, _ad in (("TRY", "Türk Lirası"), ("USD", "Dolar"), ("EUR", "Euro")):
+    SMART_DATABASE[f"NAKIT-{_cur}"] = {
+        "source": SRC_CASH, "currency": _cur, "ana_sinif": "Nakit",
+        "alt_sinif": "Mevduat / Vadesiz", "sektor": _ad,
+    }
+
+# TEFAS fon kodları 3 karakterlidir; bilinen birkaçını isimlendiriyoruz.
+TEFAS_KNOWN = {
+    "MAC": "Hisse Fonu", "TI1": "Hisse Fonu", "TTE": "Hisse Fonu",
+    "AFA": "Hisse Fonu", "IPJ": "Serbest Fon", "GBV": "Kıymetli Maden",
+    "AFT": "Para Piyasası", "TCD": "Borçlanma Araçları",
+}
+
+BIST_SUFFIX_RE = re.compile(r"\.IS$", re.IGNORECASE)
+CRYPTO_SUFFIX_RE = re.compile(r"-USD$", re.IGNORECASE)
+TEFAS_CODE_RE = re.compile(r"^[A-Z]{3}$")
+
+
+def auto_fill_asset(raw: str) -> dict[str, Any]:
+    """
+    Kullanıcı sadece sembol girdiğinde kaynak, para birimi ve sınıflandırmayı
+    doldurur. Bilinmeyen semboller için makul bir tahmin döner — kullanıcı
+    arayüzde her alanı değiştirebilir.
+    """
+    text = (raw or "").strip().upper()
+    if not text:
+        raise ValueError("Sembol boş olamaz.")
+
+    base = BIST_SUFFIX_RE.sub("", CRYPTO_SUFFIX_RE.sub("", text))
+
+    # 1) Doğrudan veritabanı eşleşmesi
+    entry = SMART_DATABASE.get(text) or SMART_DATABASE.get(base)
+    if entry:
+        key = text if text in SMART_DATABASE else base
+        data = dict(entry)
+        suffix = data.pop("yahoo_suffix", "")
+        data["display"] = key
+        data["symbol"] = f"{base}{suffix}" if data["source"] == SRC_YAHOO else key
+        data.setdefault("unit", None)
+        data["guessed"] = False
+        return _finalize(data)
+
+    # 2) Sembolün şeklinden tahmin
+    if BIST_SUFFIX_RE.search(text):
+        data = {"symbol": text, "display": base, "source": SRC_YAHOO, "currency": "TRY",
+                "ana_sinif": "Hisse Senedi", "alt_sinif": "BIST", "sektor": "Diğer BIST"}
+    elif CRYPTO_SUFFIX_RE.search(text):
+        data = {"symbol": text, "display": base, "source": SRC_YAHOO, "currency": "USD",
+                "ana_sinif": "Kripto", "alt_sinif": "Altcoin", "sektor": "Diğer Kripto"}
+    elif TEFAS_CODE_RE.match(base):
+        data = {"symbol": base, "display": base, "source": SRC_TEFAS, "currency": "TRY",
+                "ana_sinif": "Fon", "alt_sinif": "TEFAS",
+                "sektor": TEFAS_KNOWN.get(base, "Yatırım Fonu")}
+    elif "=" in text or "^" in text:  # GC=F, ^GSPC gibi Yahoo özel sembolleri
+        data = {"symbol": text, "display": text, "source": SRC_YAHOO, "currency": "USD",
+                "ana_sinif": "Diğer", "alt_sinif": "Endeks / Vadeli", "sektor": "Diğer"}
+    else:
+        data = {"symbol": base, "display": base, "source": SRC_YAHOO, "currency": "USD",
+                "ana_sinif": "Hisse Senedi", "alt_sinif": "ABD", "sektor": "Diğer ABD"}
+
+    data["unit"] = None
+    data["guessed"] = True
+    return _finalize(data)
+
+
+# --------------------------------------------------------------------------
+# DEĞERLEME MODU
+#   "qty"   -> değer = adet × canlı birim fiyat        (klasik pozisyon)
+#   "value" -> değer = elle girilen toplam tutar       (kova / Bluecoins tarzı)
+# Bir kova için fiyat kaynağı yine tanımlı olabilir; adet girildiği anda
+# moda "qty" geçilir ve fiyat canlı hesaplanmaya başlar.
+# --------------------------------------------------------------------------
+VAL_QTY = "qty"
+VAL_VALUE = "value"
+
+
+def _finalize(data: dict[str, Any]) -> dict[str, Any]:
+    data.setdefault("qty", 0.0)
+    data.setdefault("avg_cost", 0.0)
+    data.setdefault("hesap", "")
+    data.setdefault("notlar", "")
+    data.setdefault("manual_price", None)
+    data.setdefault("valuation", VAL_QTY)
+    return data
+
+
+def normalize_asset(item: dict[str, Any]) -> dict[str, Any]:
+    """
+    Eski formatta ("type"/"type_tr") kaydedilmiş varlıkları yeni şemaya taşır.
+    Böylece elinizdeki my_assets.json'u silmenize gerek kalmaz.
+    """
+    item = dict(item)
+
+    if "source" not in item:
+        legacy = str(item.get("type", "")).upper()
+        legacy_map = {
+            "TR_STOCK": (SRC_YAHOO, "Hisse Senedi", "BIST"),
+            "US_STOCK": (SRC_YAHOO, "Hisse Senedi", "ABD"),
+            "ETF": (SRC_YAHOO, "Fon", "ABD ETF"),
+            "CRYPTO": (SRC_YAHOO, "Kripto", "Altcoin"),
+            "TEFAS": (SRC_TEFAS, "Fon", "TEFAS"),
+            "GOLD": (SRC_GOLD, "Emtia", "Kıymetli Maden"),
+            "SILVER": (SRC_SILVER, "Emtia", "Kıymetli Maden"),
+            "CASH": (SRC_CASH, "Nakit", "Mevduat / Vadesiz"),
+        }
+        src, ana, alt = legacy_map.get(legacy, (SRC_YAHOO, "Diğer", "Diğer"))
+        item["source"] = src
+        item.setdefault("ana_sinif", ana)
+        item.setdefault("alt_sinif", item.get("type_tr") or alt)
+
+    item.pop("type", None)
+    item.pop("type_tr", None)
+
+    sym = str(item.get("symbol", "")).strip()
+    item["symbol"] = sym
+    item.setdefault("display", BIST_SUFFIX_RE.sub("", CRYPTO_SUFFIX_RE.sub("", sym.upper())))
+    item.setdefault("sektor", "Diğer")
+    item.setdefault("currency", "TRY")
+    item.setdefault("unit", None)
+    item["qty"] = float(item.get("qty") or 0.0)
+    item["avg_cost"] = float(item.get("avg_cost") or 0.0)
+    item.setdefault("hesap", "")
+    item.setdefault("notlar", "")
+    if item.get("source") not in VALID_SOURCES:
+        item["source"] = SRC_YAHOO
+
+    if item.get("valuation") not in (VAL_QTY, VAL_VALUE):
+        # Adet yoksa ama elle girilmiş bir tutar varsa: kova
+        item["valuation"] = (
+            VAL_VALUE
+            if (item["qty"] <= 0 and item.get("manual_price") is not None)
+            or item["source"] == SRC_MANUAL
+            else VAL_QTY
+        )
+    return item
+
+
+def asset_key(item: dict[str, Any]) -> str:
+    """Aynı varlığın farklı hesaplardaki pozisyonları ayrı satır olarak tutulur."""
+    return f"{item.get('symbol', '').upper()}|{item.get('hesap', '')}"
+
+# ==========================================================================
+# KAYNAK: portfolio/prices.py
+# ==========================================================================
+"""
+Canlı fiyat motoru.
+
+Eski koddaki sorunlar ve çözümleri:
+  * `except: pass`  -> hata yutuluyordu, fiyat sessizce eskiden kalıyordu.
+    Artık her varlık için (fiyat, kaynak, hata) üçlüsü döner, arayüz gösterir.
+  * TEFAS HTML scraping -> sayfa JavaScript ile dolduğu için BeautifulSoup
+    her zaman boş dönerdi. Artık sitenin kendi POST API'si kullanılıyor.
+  * `if True else` -> anlamsız ifade, kur çekilemezse uygulama çöküyordu.
+    Artık kur başarısız olursa açıkça uyarı verilir.
+  * Her sembol için ayrı yfinance çağrısı -> yavaş. Artık tek toplu çağrı.
+  * Altın sadece gram varsayılıyordu -> artık çeyrek/tam/ons birimleri var.
+"""
+
+
+import datetime as dt
+import logging
+import time
+from dataclasses import dataclass, field
+from typing import Any, Iterable
+
+import requests
+
+
+log = logging.getLogger(__name__)
+
+TROY_OUNCE_G = 31.1034768
+
+YAHOO_FX = {"USDTRY": "TRY=X", "EURTRY": "EURTRY=X", "EURUSD": "EURUSD=X"}
+YAHOO_GOLD = "GC=F"      # Altın vadeli, USD/ons
+YAHOO_SILVER = "SI=F"    # Gümüş vadeli, USD/ons
+
+TEFAS_URL = "https://www.tefas.gov.tr/api/DB/BindHistoryInfo"
+TEFAS_REFERER = "https://www.tefas.gov.tr/TarihselVeriler.aspx"
+
+
+@dataclass
+class Quote:
+    symbol: str
+    price: float | None = None
+    currency: str = "TRY"
+    source: str = ""
+    ok: bool = False
+    error: str = ""
+    asof: str = ""
+
+
+@dataclass
+class MarketSnapshot:
+    fx: dict[str, float] = field(default_factory=dict)
+    gold_usd_oz: float | None = None
+    silver_usd_oz: float | None = None
+    quotes: dict[str, Quote] = field(default_factory=dict)
+    errors: list[str] = field(default_factory=list)
+    fetched_at: str = ""
+
+    @property
+    def usdtry(self) -> float | None:
+        return self.fx.get("USDTRY")
+
+
+# ---------------------------------------------------------------------------
+# YAHOO FINANCE
+# ---------------------------------------------------------------------------
+def _last_close(df, ticker: str) -> float | None:
+    """yf.download çıktısından son geçerli kapanışı çıkarır (tek/çoklu sembol)."""
+    try:
+        if df is None or len(df) == 0:
+            return None
+        if hasattr(df.columns, "levels") and df.columns.nlevels > 1:
+            # Sütunlar (alan, sembol) ya da (sembol, alan) olabilir; ikisini de dene
+            if "Close" in df.columns.get_level_values(0):
+                series = df["Close"][ticker] if ticker in df["Close"].columns else None
+            elif ticker in df.columns.get_level_values(0):
+                series = df[ticker]["Close"]
+            else:
+                series = None
+        else:
+            series = df["Close"] if "Close" in df.columns else None
+        if series is None:
+            return None
+        series = series.dropna()
+        if series.empty:
+            return None
+        return float(series.iloc[-1])
+    except Exception as exc:  # pragma: no cover - savunmacı
+        log.warning("Yahoo kapanış okunamadı (%s): %s", ticker, exc)
+        return None
+
+
+def fetch_yahoo(tickers: Iterable[str], *, period: str = "5d",
+                retries: int = 2) -> dict[str, float]:
+    """Verilen sembollerin son kapanışlarını tek toplu çağrıyla getirir."""
+    tickers = sorted({t for t in tickers if t})
+    if not tickers:
+        return {}
+
+    import yfinance as yf  # yerel import: test ederken ağ gerekmesin
+
+    out: dict[str, float] = {}
+    last_exc: Exception | None = None
+    for attempt in range(retries + 1):
+        try:
+            df = yf.download(
+                tickers=" ".join(tickers),
+                period=period,
+                interval="1d",
+                auto_adjust=False,
+                progress=False,
+                threads=True,
+                group_by="column",
+            )
+            for tk in tickers:
+                px = _last_close(df, tk)
+                if px is not None and px > 0:
+                    out[tk] = px
+            if out:
+                break
+        except Exception as exc:
+            last_exc = exc
+            log.warning("Yahoo toplu çağrı hatası (deneme %s): %s", attempt + 1, exc)
+            time.sleep(1.5 * (attempt + 1))
+
+    # Toplu çağrıda düşen sembolleri tek tek dene
+    missing = [t for t in tickers if t not in out]
+    if missing:
+        for tk in missing:
+            try:
+                hist = yf.Ticker(tk).history(period=period)
+                if not hist.empty:
+                    val = float(hist["Close"].dropna().iloc[-1])
+                    if val > 0:
+                        out[tk] = val
+            except Exception as exc:
+                log.warning("Yahoo tekil çağrı hatası (%s): %s", tk, exc)
+
+    if not out and last_exc is not None:
+        raise last_exc
+    return out
+
+
+# ---------------------------------------------------------------------------
+# TEFAS
+# ---------------------------------------------------------------------------
+def _tefas_session() -> requests.Session:
+    s = requests.Session()
+    s.headers.update({
+        "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                       "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"),
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "Accept-Language": "tr-TR,tr;q=0.9,en;q=0.8",
+        "Origin": "https://www.tefas.gov.tr",
+        "Referer": TEFAS_REFERER,
+        "X-Requested-With": "XMLHttpRequest",
+        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+    })
+    return s
+
+
+def fetch_tefas(codes: Iterable[str], *, lookback_days: int = 15,
+                timeout: int = 20) -> dict[str, float]:
+    """
+    TEFAS fon fiyatlarını sitenin kendi API'sinden çeker.
+    Dönen JSON: {"data": [{"TARIH": <epoch_ms>, "FONKODU": "MAC", "FIYAT": 12.34, ...}]}
+    Her fon için en güncel tarihli FIYAT alınır.
+    """
+    codes = sorted({c.strip().upper() for c in codes if c and c.strip()})
+    if not codes:
+        return {}
+
+    session = _tefas_session()
+    try:
+        session.get(TEFAS_REFERER, timeout=timeout)  # çerez almak için
+    except Exception as exc:
+        log.info("TEFAS ısınma isteği başarısız (önemsiz): %s", exc)
+
+    end = dt.date.today()
+    start = end - dt.timedelta(days=lookback_days)
+    out: dict[str, float] = {}
+
+    for code in codes:
+        payload = {
+            "fontip": "YAT",
+            "sfontur": "",
+            "fonkod": code,
+            "fongrup": "",
+            "bastarih": start.strftime("%d.%m.%Y"),
+            "bittarih": end.strftime("%d.%m.%Y"),
+            "fonturkod": "",
+            "fonunvantip": "",
+            "strperiod": "1,1,1,1,1,1,1",
+            "islemdurum": "1",
+        }
+        try:
+            resp = session.post(TEFAS_URL, data=payload, timeout=timeout)
+            resp.raise_for_status()
+            rows = (resp.json() or {}).get("data") or []
+            rows = [r for r in rows if r.get("FIYAT") not in (None, "")]
+            if not rows:
+                continue
+            rows.sort(key=lambda r: r.get("TARIH") or 0)
+            price = float(str(rows[-1]["FIYAT"]).replace(",", "."))
+            if price > 0:
+                out[code] = price
+        except Exception as exc:
+            log.warning("TEFAS fiyatı alınamadı (%s): %s", code, exc)
+
+    return out
+
+
+# ---------------------------------------------------------------------------
+# ANA GİRİŞ NOKTASI
+# ---------------------------------------------------------------------------
+def _metal_unit_price(usd_per_oz: float, unit: str | None, currency: str,
+                      usdtry: float | None) -> float | None:
+    grams = METAL_UNITS.get((unit or "GRAM").upper(), 1.0)
+    usd_price = (usd_per_oz / TROY_OUNCE_G) * grams
+    if currency == "USD":
+        return usd_price
+    if usdtry:
+        return usd_price * usdtry
+    return None
+
+
+def build_snapshot(assets: list[dict[str, Any]]) -> MarketSnapshot:
+    """Portföydeki her varlık için güncel fiyatı toplar."""
+    snap = MarketSnapshot(fetched_at=_now_istanbul())
+
+    yahoo_tickers = {a["symbol"] for a in assets if a.get("source") == SRC_YAHOO}
+    tefas_codes = {a["symbol"] for a in assets if a.get("source") == SRC_TEFAS}
+    needs_gold = any(a.get("source") == SRC_GOLD for a in assets)
+    needs_silver = any(a.get("source") == SRC_SILVER for a in assets)
+
+    # Kur her zaman gerekli (USD varlıkların TRY karşılığı için)
+    infra = set(YAHOO_FX.values())
+    if needs_gold:
+        infra.add(YAHOO_GOLD)
+    if needs_silver:
+        infra.add(YAHOO_SILVER)
+
+    try:
+        prices = fetch_yahoo(yahoo_tickers | infra)
+    except Exception as exc:
+        prices = {}
+        snap.errors.append(f"Yahoo Finance'e ulaşılamadı: {exc}")
+
+    for name, tk in YAHOO_FX.items():
+        if tk in prices:
+            snap.fx[name] = prices[tk]
+    if "USDTRY" not in snap.fx:
+        snap.errors.append(
+            "USD/TRY kuru çekilemedi — dolar bazlı varlıkların TL karşılığı hesaplanamaz."
+        )
+
+    snap.gold_usd_oz = prices.get(YAHOO_GOLD)
+    snap.silver_usd_oz = prices.get(YAHOO_SILVER)
+    if needs_gold and snap.gold_usd_oz is None:
+        snap.errors.append("Altın ons fiyatı (GC=F) çekilemedi.")
+    if needs_silver and snap.silver_usd_oz is None:
+        snap.errors.append("Gümüş ons fiyatı (SI=F) çekilemedi.")
+
+    tefas_prices: dict[str, float] = {}
+    if tefas_codes:
+        try:
+            tefas_prices = fetch_tefas(tefas_codes)
+        except Exception as exc:
+            snap.errors.append(f"TEFAS'a ulaşılamadı: {exc}")
+        # Sadece değeri fiyata BAĞLI olan satırlar için uyar; kova satırlarının
+        # değeri elle girilen tutardan gelir, fiyat bilgisi orada sadece yardımcıdır.
+        critical = {a["symbol"].upper() for a in assets
+                    if a.get("source") == SRC_TEFAS
+                    and a.get("valuation") != "value"}
+        missing = (tefas_codes & critical) - set(tefas_prices)
+        if missing:
+            snap.errors.append(
+                "TEFAS fiyatı bulunamadı: " + ", ".join(sorted(missing))
+            )
+
+    for asset in assets:
+        sym = asset["symbol"]
+        src = asset.get("source", SRC_YAHOO)
+        cur = asset.get("currency", "TRY")
+        q = Quote(symbol=sym, currency=cur, source=src, asof=snap.fetched_at)
+
+        if src == SRC_YAHOO:
+            px = prices.get(sym)
+            if px:
+                q.price, q.ok = px, True
+            else:
+                q.error = "Yahoo Finance bu sembol için veri döndürmedi."
+        elif src == SRC_TEFAS:
+            px = tefas_prices.get(sym.upper())
+            if px:
+                q.price, q.ok = px, True
+            else:
+                q.error = "TEFAS bu fon kodu için fiyat döndürmedi."
+        elif src in (SRC_GOLD, SRC_SILVER):
+            oz = snap.gold_usd_oz if src == SRC_GOLD else snap.silver_usd_oz
+            if oz:
+                px = _metal_unit_price(oz, asset.get("unit"), cur, snap.usdtry)
+                if px:
+                    q.price, q.ok = px, True
+                else:
+                    q.error = "USD/TRY kuru olmadan TL fiyatı hesaplanamadı."
+            else:
+                q.error = "Ons fiyatı alınamadı."
+        elif src == SRC_CASH:
+            q.price, q.ok = 1.0, True
+        elif src == SRC_MANUAL:
+            px = asset.get("manual_price")
+            if px:
+                q.price, q.ok = float(px), True
+            else:
+                q.error = "Elle fiyat girilmemiş."
+        else:
+            q.error = f"Bilinmeyen fiyat kaynağı: {src}"
+
+        snap.quotes[sym] = q
+
+    return snap
+
+
+def _now_istanbul() -> str:
+    try:
+        from zoneinfo import ZoneInfo
+        now = dt.datetime.now(ZoneInfo("Europe/Istanbul"))
+    except Exception:
+        now = dt.datetime.utcnow() + dt.timedelta(hours=3)
+    return now.strftime("%d.%m.%Y %H:%M")
+
+# ==========================================================================
+# KAYNAK: portfolio/storage.py
+# ==========================================================================
+"""
+Kalıcı depolama: GitHub Contents API üzerinden JSON commit'leme.
+
+NEDEN: Streamlit Community Cloud'da dosya sistemi geçicidir. Uygulama uykuya
+girip uyandığında ya da yeniden deploy olduğunda `open(...,"w")` ile yazdığınız
+my_assets.json SİLİNİR. Eklediğiniz varlıklar kaybolur. Bu yüzden portföy
+kaydı doğrudan GitHub deposuna commit edilir; depo tek doğruluk kaynağıdır.
+
+KURULUM
+-------
+1) GitHub'da ince taneli (fine-grained) bir kişisel erişim jetonu üretin:
+   Settings > Developer settings > Personal access tokens > Fine-grained tokens
+   - Repository access: sadece bu depo
+   - Permissions > Repository permissions > Contents: Read and write
+2) Streamlit Cloud > App > Settings > Secrets alanına şunu yapıştırın:
+
+   [github]
+   token  = "github_pat_..."
+   repo   = "kullanici-adi/depo-adi"
+   branch = "main"
+   path   = "my_assets.json"
+
+Jeton yoksa uygulama otomatik olarak yerel dosya moduna düşer (lokal geliştirme).
+"""
+
+
+import base64
+import json
+import logging
+import os
+from dataclasses import dataclass
+from typing import Any
+
+import requests
+
+log = logging.getLogger(__name__)
+
+API = "https://api.github.com"
+DEFAULT_PATH = "my_assets.json"
+
+
+class StorageError(RuntimeError):
+    pass
+
+
+@dataclass
+class LoadResult:
+    data: Any
+    sha: str | None
+    backend: str          # "github" | "local"
+    message: str = ""
+
+
+class Storage:
+    """GitHub'a yazar; yapılandırma yoksa yerel dosyaya düşer."""
+
+    def __init__(self, config: dict[str, Any] | None = None,
+                 local_path: str = DEFAULT_PATH):
+        cfg = dict(config or {})
+        self.token = (cfg.get("token") or "").strip()
+        self.repo = (cfg.get("repo") or "").strip()
+        self.branch = (cfg.get("branch") or "main").strip()
+        self.path = (cfg.get("path") or local_path).strip()
+        self.local_path = local_path
+        self.committer_name = cfg.get("committer_name") or "aether-nexus-bot"
+        self.committer_email = cfg.get("committer_email") or "bot@users.noreply.github.com"
+        self._sha: str | None = None
+
+    # -- durum -------------------------------------------------------------
+    @property
+    def enabled(self) -> bool:
+        return bool(self.token and self.repo)
+
+    @property
+    def backend(self) -> str:
+        return "github" if self.enabled else "local"
+
+    def describe(self) -> str:
+        if self.enabled:
+            return f"GitHub → {self.repo}@{self.branch}/{self.path}"
+        return f"Yerel dosya → {self.local_path} (kalıcı değil!)"
+
+    # -- iç yardımcılar ----------------------------------------------------
+    def _headers(self) -> dict[str, str]:
+        return {
+            "Authorization": f"Bearer {self.token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
+
+    def _url(self) -> str:
+        return f"{API}/repos/{self.repo}/contents/{self.path}"
+
+    # -- okuma -------------------------------------------------------------
+    def load(self, default: Any = None) -> LoadResult:
+        if default is None:
+            default = []
+
+        if self.enabled:
+            try:
+                r = requests.get(self._url(), headers=self._headers(),
+                                 params={"ref": self.branch}, timeout=20)
+                if r.status_code == 404:
+                    self._sha = None
+                    return LoadResult(default, None, "github",
+                                      "Depoda dosya yok, ilk kayıtta oluşturulacak.")
+                r.raise_for_status()
+                payload = r.json()
+                self._sha = payload.get("sha")
+                raw = base64.b64decode(payload.get("content", "")).decode("utf-8")
+                return LoadResult(json.loads(raw or "[]"), self._sha, "github")
+            except Exception as exc:
+                log.error("GitHub okuma hatası: %s", exc)
+                raise StorageError(f"GitHub'dan okunamadı: {exc}") from exc
+
+        if os.path.exists(self.local_path):
+            with open(self.local_path, "r", encoding="utf-8") as f:
+                return LoadResult(json.load(f), None, "local")
+        return LoadResult(default, None, "local", "Yerel dosya bulunamadı.")
+
+    # -- yazma -------------------------------------------------------------
+    def save(self, data: Any, message: str = "portföy güncellendi") -> str:
+        body = json.dumps(data, indent=2, ensure_ascii=False) + "\n"
+
+        # Yerel kopya her zaman yazılır (aynı oturumda hızlı okuma için)
+        try:
+            with open(self.local_path, "w", encoding="utf-8") as f:
+                f.write(body)
+        except OSError as exc:
+            log.warning("Yerel kopya yazılamadı: %s", exc)
+
+        if not self.enabled:
+            return "local"
+
+        payload = {
+            "message": message,
+            "content": base64.b64encode(body.encode("utf-8")).decode("ascii"),
+            "branch": self.branch,
+            "committer": {"name": self.committer_name, "email": self.committer_email},
+        }
+
+        for attempt in range(2):
+            if self._sha:
+                payload["sha"] = self._sha
+            else:
+                payload.pop("sha", None)
+            r = requests.put(self._url(), headers=self._headers(),
+                             json=payload, timeout=25)
+            if r.status_code in (200, 201):
+                self._sha = (r.json().get("content") or {}).get("sha")
+                return self._sha or "ok"
+            if r.status_code == 409 and attempt == 0:
+                # Başka bir yerden commit gelmiş; sha'yı tazeleyip bir kez daha dene
+                log.info("GitHub 409 çakışması, sha tazeleniyor.")
+                try:
+                    self.load()
+                except StorageError:
+                    pass
+                continue
+            raise StorageError(
+                f"GitHub'a yazılamadı (HTTP {r.status_code}): {r.text[:300]}"
+            )
+        raise StorageError("GitHub'a yazılamadı: çakışma çözülemedi.")
+
+
+def storage_from_secrets(secrets: Any, local_path: str = DEFAULT_PATH) -> Storage:
+    """st.secrets nesnesinden Storage üretir; bölüm yoksa yerel moda düşer."""
+    cfg: dict[str, Any] = {}
+    try:
+        if secrets is not None and "github" in secrets:
+            cfg = dict(secrets["github"])
+    except Exception as exc:
+        log.info("secrets okunamadı: %s", exc)
+    return Storage(cfg, local_path=local_path)
+
+# ==========================================================================
+# KAYNAK: portfolio/analytics.py
+# ==========================================================================
+"""
+Portföy hesaplamaları ve grafik verisi üretimi.
+
+Buradaki iki kritik düzeltme:
+  1) Sankey düğüm çakışması: eski kodda etiketler tek bir sözlükte toplanıyordu.
+     Bir sektör adı bir alt sınıf adıyla (veya bir sembol bir sektörle) aynı
+     olduğunda düğümler birleşiyor, akışlar yanlış yere gidiyordu. Artık her
+     düğümün kimliği tam yol ("Hisse Senedi > BIST > Bankacılık") üzerinden
+     üretiliyor; etikette sadece son parça gösteriliyor.
+  2) Toplam kâr/zarar yüzdesi: satır bazlı yüzdelerin ortalaması yanlıştır.
+     Toplam, TL cinsinden maliyet ve değer üzerinden hesaplanır.
+"""
+
+
+from typing import Any
+
+import math
+
+import pandas as pd
+
+# dataviz referans paletinin koyu zemin adımları (doğrulanmış sıra)
+SERIES_COLORS = [
+    "#3987e5",  # mavi
+    "#d95926",  # turuncu
+    "#199e70",  # deniz yeşili
+    "#c98500",  # sarı
+    "#d55181",  # macenta
+    "#2f9e44",  # yeşil (koyu zeminde okunurluk için bir adım açıldı)
+    "#9085e9",  # mor
+    "#e66767",  # kırmızı
+]
+OTHER_COLOR = "#6b6b66"
+ACCENT = "#00f3ff"
+POS_COLOR = "#199e70"
+NEG_COLOR = "#e66767"
+
+
+def color_map(keys: list[str]) -> dict[str, str]:
+    """Kategoriye sabit renk atar; 9. kategoriden sonrası 'Diğer' rengine düşer."""
+    out: dict[str, str] = {}
+    for i, k in enumerate(keys):
+        out[k] = SERIES_COLORS[i] if i < len(SERIES_COLORS) else OTHER_COLOR
+    return out
+
+
+def to_try_rate(currency: str, fx: dict[str, float]) -> float:
+    """Bir para biriminin TL karşılığı. Kur yoksa NaN döner (sessizce 1 varsaymaz)."""
+    cur = (currency or "TRY").upper()
+    if cur == "TRY":
+        return 1.0
+    if cur == "USD":
+        return fx.get("USDTRY", float("nan"))
+    if cur == "EUR":
+        if "EURTRY" in fx:
+            return fx["EURTRY"]
+        if "EURUSD" in fx and "USDTRY" in fx:
+            return fx["EURUSD"] * fx["USDTRY"]
+    return float("nan")
+
+
+def build_dataframe(assets: list[dict[str, Any]], quotes: dict[str, Any],
+                    fx: dict[str, float] | None = None) -> pd.DataFrame:
+    """Varlık listesi + fiyatlardan hesaplanmış tabloyu üretir."""
+    fx = fx or {}
+    rows: list[dict[str, Any]] = []
+    for a in assets:
+        sym = a["symbol"]
+        q = quotes.get(sym)
+        price = getattr(q, "price", None) if q is not None else None
+        ok = bool(getattr(q, "ok", False)) if q is not None else False
+        err = getattr(q, "error", "") if q is not None else "Fiyat çekilmedi."
+
+        cur = a.get("currency", "TRY")
+        qty = float(a.get("qty") or 0.0)
+        cost = float(a.get("avg_cost") or 0.0)
+        rate = to_try_rate(cur, fx)
+        price_val = float(price) if price else float("nan")
+
+        # Değerleme modu: adet × canlı fiyat mı, elle girilen toplam tutar mı?
+        kova = a.get("valuation") == "value"
+        if kova:
+            deger_nat = float(a.get("manual_price") or 0.0)   # toplam tutar
+            maliyet_nat = cost                                 # toplam maliyet
+            ok = True
+            err = ""
+            if not math.isnan(price_val) and price_val > 0:
+                err = ""  # canlı fiyat bilgi amaçlı gösterilir
+            else:
+                price_val = float("nan")
+        else:
+            deger_nat = qty * price_val
+            maliyet_nat = qty * cost
+
+        rows.append({
+            "Sembol": a.get("display") or sym,
+            "Yahoo Sembol": sym,
+            "Ana Sınıf": a.get("ana_sinif", "Diğer"),
+            "Alt Sınıf": a.get("alt_sinif", "Diğer"),
+            "Sektör": a.get("sektor", "Diğer"),
+            "Hesap": a.get("hesap", ""),
+            "Kaynak": a.get("source", ""),
+            "Birim": a.get("unit") or "",
+            "Para Birimi": cur,
+            "Değerleme": "Kova (elle)" if kova else "Adet × Fiyat",
+            "Adet": qty,
+            "Maliyet": cost,
+            "Fiyat": price_val,
+            "Maliyet (TRY)": maliyet_nat * rate,
+            "Değer (TRY)": deger_nat * rate,
+            "K/Z (TRY)": (deger_nat - maliyet_nat) * rate,
+            "K/Z %": ((deger_nat - maliyet_nat) / maliyet_nat * 100.0)
+                     if maliyet_nat > 0 else float("nan"),
+            "Fiyat OK": ok,
+            "Hata": "" if ok else err,
+        })
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+
+    total = df["Değer (TRY)"].sum(skipna=True)
+    df["Ağırlık %"] = (df["Değer (TRY)"] / total * 100.0) if total else float("nan")
+    return df.sort_values("Değer (TRY)", ascending=False, na_position="last")
+
+
+BORC_SINIFLARI = {"Yükümlülük"}
+
+
+def split_borc(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Varlık satırlarını borç satırlarından ayırır."""
+    if df.empty:
+        return df, df
+    mask = df["Ana Sınıf"].isin(BORC_SINIFLARI)
+    return df[~mask], df[mask]
+
+
+def totals(df: pd.DataFrame, usdtry: float | None) -> dict[str, float]:
+    empty = {"deger_try": 0.0, "maliyet_try": 0.0, "kz_try": 0.0, "kz_pct": 0.0,
+             "deger_usd": float("nan"), "eksik": 0, "borc_try": 0.0, "net_try": 0.0}
+    if df.empty:
+        return empty
+
+    varlik, borc = split_borc(df)
+    deger = float(varlik["Değer (TRY)"].sum(skipna=True))
+    maliyet = float(varlik["Maliyet (TRY)"].sum(skipna=True))
+    borc_try = abs(float(borc["Değer (TRY)"].sum(skipna=True))) if not borc.empty else 0.0
+    kz = deger - maliyet
+    return {
+        "deger_try": deger,
+        "maliyet_try": maliyet,
+        "kz_try": kz,
+        "kz_pct": (kz / maliyet * 100.0) if maliyet else 0.0,
+        "deger_usd": (deger / usdtry) if usdtry else float("nan"),
+        "eksik": int((~df["Fiyat OK"]).sum()),
+        "borc_try": borc_try,
+        "net_try": deger - borc_try,
+    }
+
+
+def allocation(df: pd.DataFrame, level: str) -> pd.DataFrame:
+    """Bir hiyerarşi seviyesine göre dağılım tablosu."""
+    if df.empty or level not in df.columns:
+        return pd.DataFrame(columns=[level, "Değer (TRY)", "Pay %"])
+    g = (df.groupby(level, dropna=False)["Değer (TRY)"]
+           .sum(min_count=1).reset_index())
+    total = g["Değer (TRY)"].sum(skipna=True)
+    g["Pay %"] = (g["Değer (TRY)"] / total * 100.0) if total else float("nan")
+    return g.sort_values("Değer (TRY)", ascending=False)
+
+
+def sankey_data(df: pd.DataFrame, levels: list[str]) -> dict[str, Any]:
+    """
+    Çok seviyeli akış diyagramı için düğüm/bağlantı verisi.
+    Düğüm kimliği tam yoldur; bu sayede aynı isimli sektör ve sembol birbirine
+    karışmaz (eski koddaki en büyük görsel hata buydu).
+    """
+    if df.empty or "Değer (TRY)" not in df.columns or not levels:
+        return {"labels": [], "paths": [], "source": [], "target": [], "value": [],
+                "node_colors": [], "link_colors": []}
+    valid = df[df["Değer (TRY)"].notna() & (df["Değer (TRY)"] > 0)]
+    if valid.empty:
+        return {"labels": [], "paths": [], "source": [], "target": [], "value": [],
+                "node_colors": [], "link_colors": []}
+
+    root_key = "__ROOT__"
+    node_ids: dict[str, int] = {root_key: 0}
+    labels: list[str] = ["Portföy"]
+    paths: list[str] = ["Portföy"]
+
+    top_level = levels[0]
+    top_colors = color_map(
+        list(allocation(valid, top_level)[top_level].astype(str))
+    )
+    node_colors: list[str] = [ACCENT]
+    node_group: list[str] = ["Portföy"]
+
+    def node(path: tuple[str, ...], group: str) -> int:
+        key = " > ".join(path)
+        if key not in node_ids:
+            node_ids[key] = len(labels)
+            labels.append(path[-1])
+            paths.append(key)
+            node_colors.append(top_colors.get(group, OTHER_COLOR))
+            node_group.append(group)
+        return node_ids[key]
+
+    src: list[int] = []
+    tgt: list[int] = []
+    val: list[float] = []
+    link_colors: list[str] = []
+
+    for depth in range(len(levels)):
+        keys = levels[: depth + 1]
+        grouped = valid.groupby([valid[k].fillna("Belirsiz").astype(str) for k in keys],
+                                dropna=False)["Değer (TRY)"].sum(min_count=1)
+        for combo, amount in grouped.items():
+            if amount is None or amount <= 0:
+                continue
+            combo = combo if isinstance(combo, tuple) else (combo,)
+            group = combo[0]
+            parent = 0 if depth == 0 else node(combo[:-1], group)
+            child = node(combo, group)
+            src.append(parent)
+            tgt.append(child)
+            val.append(float(amount))
+            link_colors.append(_rgba(top_colors.get(group, OTHER_COLOR), 0.35))
+
+    return {
+        "labels": labels,
+        "paths": paths,
+        "source": src,
+        "target": tgt,
+        "value": val,
+        "node_colors": node_colors,
+        "link_colors": link_colors,
+    }
+
+
+def _rgba(hex_color: str, alpha: float) -> str:
+    h = hex_color.lstrip("#")
+    r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    return f"rgba({r},{g},{b},{alpha})"
+
+
+def merge_position(assets: list[dict[str, Any]], new: dict[str, Any],
+                   mode: str = "replace") -> list[dict[str, Any]]:
+    """
+    Varlık ekler veya günceller.
+      mode="replace" : mevcut satırı olduğu gibi değiştirir
+      mode="add"     : adet ekler ve ağırlıklı ortalama maliyeti yeniden hesaplar
+    Eski kodda her ekleme mevcut pozisyonu eziyordu; ikinci alım yaptığınızda
+    ortalama maliyetiniz kayboluyordu.
+    """
+
+    out = [dict(a) for a in assets]
+    key = asset_key(new)
+    idx = next((i for i, a in enumerate(out) if asset_key(a) == key), None)
+
+    if idx is None:
+        out.append(dict(new))
+        return out
+
+    if mode == "add":
+        old = out[idx]
+        q_old, c_old = float(old.get("qty") or 0), float(old.get("avg_cost") or 0)
+        q_new, c_new = float(new.get("qty") or 0), float(new.get("avg_cost") or 0)
+        q_tot = q_old + q_new
+        merged = dict(old)
+        merged.update({k: v for k, v in new.items()
+                       if k not in ("qty", "avg_cost")})
+        merged["qty"] = q_tot
+        merged["avg_cost"] = ((q_old * c_old + q_new * c_new) / q_tot) if q_tot else 0.0
+        out[idx] = merged
+    else:
+        out[idx] = dict(new)
+    return out
+
+# ==========================================================================
+# KAYNAK: app.py
+# ==========================================================================
+
+
+# --- Modül kısayolları -------------------------------------------------------
+# Modüler sürümde `an` = analytics, `px` = prices modülüydü. Tek dosyada hepsi
+# aynı isim alanında olduğundan ikisini de bu dosyanın global alanına bağlıyoruz.
+# (sys.modules kullanılmıyor: Streamlit betiği kendi isim alanında çalıştırır.)
+class _Namespace:
+    def __getattr__(self, name):
+        try:
+            return globals()[name]
+        except KeyError as exc:
+            raise AttributeError(name) from exc
+
+
+an = px = _Namespace()
+
+"""
 AETHER NEXUS — Canlı portföy takip uygulaması.
 Streamlit üzerinde çalışır, portföyünü GitHub deposunda kalıcı tutar.
 
 Çalıştırma:  streamlit run app.py
 """
 
-from __future__ import annotations
 
 import logging
 
@@ -13,26 +1166,6 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from portfolio import analytics as an
-from portfolio import prices as px
-from portfolio.classification import (
-    ANA_SINIFLAR,
-    HIERARCHY,
-    HIERARCHY_LABELS,
-    METAL_UNITS,
-    SRC_CASH,
-    SRC_GOLD,
-    SRC_MANUAL,
-    SRC_SILVER,
-    SRC_TEFAS,
-    SRC_YAHOO,
-    VAL_QTY,
-    VAL_VALUE,
-    asset_key,
-    auto_fill_asset,
-    normalize_asset,
-)
-from portfolio.storage import Storage, StorageError, storage_from_secrets
 
 logging.basicConfig(level=logging.INFO)
 

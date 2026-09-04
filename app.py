@@ -2738,9 +2738,26 @@ def get_history_store() -> Storage:
     return base
 
 
-@st.cache_data(ttl=300, show_spinner=False)
-def cached_snapshot(fingerprint: str, assets: list[dict]) -> px.MarketSnapshot:
-    return px.build_snapshot(assets)
+@st.cache_resource(ttl=300, show_spinner=False)
+def cached_snapshot(fingerprint: str, _assets: list[dict]) -> px.MarketSnapshot:
+    """
+    Piyasa anlık görüntüsünü önbellekler.
+
+    NEDEN cache_data DEĞİL cache_resource:
+      st.cache_data dönen değeri PICKLE eder. MarketSnapshot ve Quote tek
+      dosya sürümünde betiğin kendi isim alanında tanımlıdır; pickle bir
+      sınıfı ancak içe aktarılabilir bir modülde bulabildiği için burada
+      UnserializableReturnValueError atıyordu. Modüler sürümde sınıflar
+      portfolio.prices içinde olduğu için aynı kod sorunsuz çalışıyordu —
+      yani hata yalnızca dağıtılan sürümde ortaya çıkıyordu.
+      cache_resource nesneyi olduğu gibi saklar, serileştirmez.
+
+    `_assets` alt çizgiyle başlıyor: Streamlit bu parametreyi
+    ANAHTARLAMADA KULLANMAZ. Önbellek anahtarı fingerprint'tir; fiyatlar
+    yalnızca sembol/kaynak/birim üçlüsüne bağlı olduğu için adet veya
+    maliyet değişince fiyatları yeniden çekmek gereksizdir.
+    """
+    return px.build_snapshot(_assets)
 
 
 def snapshot_fingerprint(assets: list[dict]) -> str:
@@ -2782,8 +2799,16 @@ with head_r:
         st.rerun()
 
 with st.spinner("Piyasa verisi çekiliyor…"):
-    snap = (cached_snapshot(snapshot_fingerprint(assets), assets) if assets
-            else px.MarketSnapshot(fetched_at=px._now_istanbul()))
+    if not assets:
+        snap = px.MarketSnapshot(fetched_at=px._now_istanbul())
+    else:
+        # Önbellek bir HIZLANDIRMADIR; bozulursa uygulamayı düşürmemeli.
+        try:
+            snap = cached_snapshot(snapshot_fingerprint(assets), assets)
+        except Exception as exc:                          # noqa: BLE001
+            st.caption(f"ℹ️ Fiyat önbelleği devre dışı ({type(exc).__name__}); "
+                       f"veriler doğrudan çekiliyor.")
+            snap = px.build_snapshot(assets)
 
 usdtry = snap.usdtry
 # fmt_try() bu sözlüğü globals() üzerinden okur; kur her yenilemede tazelenir.
@@ -3302,9 +3327,15 @@ with tab_ekle:
         "Sembol / Kod", placeholder="ALKA · NVDA · MAC · BTC · ALTIN-CEYREK · NAKIT-USD",
         label_visibility="collapsed")
 
-    @st.cache_data(ttl=900, show_spinner=False)
-    def cached_probe(raw: str):
-        """Sembolü gerçek kaynaklarda yoklar (15 dk önbellekli)."""
+    @st.cache_resource(ttl=900, show_spinner=False)
+    def cached_probe(raw: str) -> list:
+        """
+        Sembolü gerçek kaynaklarda yoklar (15 dk önbellekli).
+
+        cached_snapshot ile aynı sebeple cache_resource: probe_symbol
+        yerel bir dataclass olan Candidate listesi döndürür, cache_data
+        bunu pickle edemez (bkz. cached_snapshot açıklaması).
+        """
         return px.probe_symbol(raw)
 
     if sym_in.strip():

@@ -387,6 +387,7 @@ VAL_VALUE = "value"
 def _finalize(data: dict[str, Any]) -> dict[str, Any]:
     data.setdefault("qty", 0.0)
     data.setdefault("avg_cost", 0.0)
+    data.setdefault("cost_currency", data.get("currency", "TRY"))
     data.setdefault("hesap", "")
     data.setdefault("notlar", "")
     data.setdefault("manual_price", None)
@@ -429,6 +430,13 @@ def normalize_asset(item: dict[str, Any]) -> dict[str, Any]:
     item.setdefault("unit", None)
     item["qty"] = float(item.get("qty") or 0.0)
     item["avg_cost"] = float(item.get("avg_cost") or 0.0)
+    # Maliyetin para birimi fiyatınkinden FARKLI olabilir: BIST hissesinin
+    # fiyatı TRY'dir ama maliyeti dolar bazlı bir rapordan gelmiş olabilir.
+    # Ayrı tutulmazsa maliyeti içe aktarırken dondurulmuş bir kurla TRY'ye
+    # çevirmek zorunda kalırız; ayrı tutulunca uygulama her açılışta güncel
+    # kurla çevirir.
+    item["cost_currency"] = (str(item.get("cost_currency") or "").upper()
+                             or item.get("currency", "TRY"))
     item.setdefault("hesap", "")
     item.setdefault("notlar", "")
     item.setdefault("manual_price", None)
@@ -468,7 +476,10 @@ log = logging.getLogger(__name__)
 
 TROY_OUNCE_G = 31.1034768
 
-YAHOO_FX = {"USDTRY": "TRY=X", "EURTRY": "EURTRY=X", "EURUSD": "EURUSD=X"}
+YAHOO_FX = {"USDTRY": "TRY=X", "EURTRY": "EURTRY=X", "EURUSD": "EURUSD=X",
+            # Hong Kong (SEHK) hisseleri HKD fiyatlanır. Doğrudan HKDTRY
+            # gelmezse analytics.to_try_rate USDHKD üzerinden türetir.
+            "HKDTRY": "HKDTRY=X", "USDHKD": "HKD=X"}
 YAHOO_GOLD = "GC=F"      # Altın vadeli, USD/ons
 YAHOO_SILVER = "SI=F"    # Gümüş vadeli, USD/ons
 
@@ -1038,6 +1049,12 @@ def to_try_rate(currency: str, fx: dict[str, float]) -> float:
             return fx["EURTRY"]
         if "EURUSD" in fx and "USDTRY" in fx:
             return fx["EURUSD"] * fx["USDTRY"]
+    if cur == "HKD":
+        if "HKDTRY" in fx:
+            return fx["HKDTRY"]
+        # USDHKD = 1 USD kaç HKD -> 1 HKD = USDTRY / USDHKD lira
+        if fx.get("USDHKD") and "USDTRY" in fx:
+            return fx["USDTRY"] / fx["USDHKD"]
     return float("nan")
 
 
@@ -1057,6 +1074,10 @@ def build_dataframe(assets: list[dict[str, Any]], quotes: dict[str, Any],
         qty = float(a.get("qty") or 0.0)
         cost = float(a.get("avg_cost") or 0.0)
         rate = to_try_rate(cur, fx)
+        # Maliyet ayrı bir para biriminde tutulabilir (bkz. classification.
+        # normalize_asset): BIST hissesinin fiyatı TRY, maliyeti USD olabilir.
+        cost_cur = a.get("cost_currency") or cur
+        cost_rate = rate if cost_cur == cur else to_try_rate(cost_cur, fx)
         price_val = float(price) if price else float("nan")
 
         # Değerleme modu: adet × canlı fiyat mı, elle girilen toplam tutar mı?
@@ -1084,15 +1105,17 @@ def build_dataframe(assets: list[dict[str, Any]], quotes: dict[str, Any],
             "Kaynak": a.get("source", ""),
             "Birim": a.get("unit") or "",
             "Para Birimi": cur,
+            "Maliyet Para Birimi": cost_cur,
             "Değerleme": "Diğer" if kova else "Canlı",
             "Adet": qty,
             "Maliyet": cost,
             "Fiyat": price_val,
-            "Maliyet (TRY)": maliyet_nat * rate,
+            "Maliyet (TRY)": maliyet_nat * cost_rate,
             "Değer (TRY)": deger_nat * rate,
-            "K/Z (TRY)": (deger_nat - maliyet_nat) * rate,
-            "K/Z %": ((deger_nat - maliyet_nat) / maliyet_nat * 100.0)
-                     if maliyet_nat > 0 else float("nan"),
+            "K/Z (TRY)": deger_nat * rate - maliyet_nat * cost_rate,
+            "K/Z %": ((deger_nat * rate - maliyet_nat * cost_rate)
+                      / (maliyet_nat * cost_rate) * 100.0)
+                     if maliyet_nat * cost_rate > 0 else float("nan"),
             "Fiyat OK": ok,
             "Hata": "" if ok else err,
         })
@@ -1164,7 +1187,7 @@ def split_borc(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
 def totals(df: pd.DataFrame, usdtry: float | None) -> dict[str, float]:
     empty = {"deger_try": 0.0, "maliyet_try": 0.0, "kz_try": 0.0, "kz_pct": 0.0,
              "deger_usd": float("nan"), "eksik": 0, "borc_try": 0.0, "net_try": 0.0}
-    if df.empty:
+    if df is None or df.empty:
         return empty
 
     varlik, borc = split_borc(df)
@@ -1182,6 +1205,59 @@ def totals(df: pd.DataFrame, usdtry: float | None) -> dict[str, float]:
         "borc_try": borc_try,
         "net_try": deger - borc_try,
     }
+
+
+# ---------------------------------------------------------------------------
+# GÖRÜNTÜLEME PARA BİRİMİ
+# Bütün hesaplar TRY üzerinden yapılır; burada sadece SUNUM çevrilir. Böylece
+# para birimini değiştirmek hiçbir hesabı, oranı veya sıralamayı bozmaz.
+# ---------------------------------------------------------------------------
+DISPLAY_CURRENCIES = ("TRY", "USD", "EUR")
+CURRENCY_SYMBOLS = {"TRY": "₺", "USD": "$", "EUR": "€"}
+
+
+def display_rate(currency: str, fx: dict[str, float] | None) -> float:
+    """1 TRY kaç <currency> eder? TRY için 1.0, kur yoksa NaN."""
+    cur = (currency or "TRY").upper()
+    if cur == "TRY":
+        return 1.0
+    try_per_unit = to_try_rate(cur, fx or {})
+    if not try_per_unit or try_per_unit != try_per_unit or try_per_unit <= 0:
+        return float("nan")
+    return 1.0 / try_per_unit
+
+
+def format_money(try_value: float, currency: str, fx: dict[str, float] | None,
+                 decimals: int | None = None) -> str:
+    """TRY tutarını seçilen para biriminde biçimlendirir."""
+    if try_value != try_value:
+        return "—"
+    oran = display_rate(currency, fx)
+    if oran != oran:
+        return "—"
+    cur = (currency or "TRY").upper()
+    tutar = try_value * oran
+    if decimals is None:
+        decimals = 0 if abs(tutar) >= 100 else 2
+    return f"{CURRENCY_SYMBOLS.get(cur, '')}{tutar:,.{decimals}f}"
+
+
+def convert_columns(df: pd.DataFrame, currency: str,
+                    fx: dict[str, float] | None) -> pd.DataFrame:
+    """(TRY) ile biten sütunları seçilen para birimine çevirir, başlığı yeniler."""
+    if df is None or df.empty or (currency or "TRY").upper() == "TRY":
+        return df
+    oran = display_rate(currency, fx)
+    if oran != oran:
+        return df
+    cur = currency.upper()
+    out = df.copy()
+    yeniden_ad: dict[str, str] = {}
+    for col in out.columns:
+        if isinstance(col, str) and col.endswith("(TRY)"):
+            out[col] = out[col] * oran
+            yeniden_ad[col] = col.replace("(TRY)", f"({cur})")
+    return out.rename(columns=yeniden_ad)
 
 
 def allocation(df: pd.DataFrame, level: str) -> pd.DataFrame:
@@ -1395,7 +1471,7 @@ def derive_valuation(qty: float, source: str) -> str:
     if source == SRC_MANUAL:
         return VAL_VALUE
     return VAL_QTY if (qty or 0) > 0 else VAL_VALUE
-CURRENCIES = ["TRY", "USD", "EUR"]
+CURRENCIES = ["TRY", "USD", "EUR", "HKD"]
 
 # Altın/gümüş dışındaki satırlarda "Birim" boş kalır; tabloda "Yok" görünür.
 NO_UNIT = "Yok"
@@ -1403,7 +1479,8 @@ UNIT_OPTIONS = [NO_UNIT] + list(METAL_UNITS)
 
 EDIT_COLS = ["Sembol", "Fiyat Sembolü", "Kaynak", "Değerleme", "Para Birimi",
              "Ana Sınıf", "Alt Sınıf", "Sektör", "Hesap", "Birim",
-             "Adet", "Birim Maliyet", "Son Değer", "Notlar"]
+             "Adet", "Birim Maliyet", "Maliyet Para Birimi", "Son Değer",
+             "Notlar"]
 
 _SRC_REV = {v: k for k, v in SOURCE_LABELS.items()}
 _VAL_REV = {v: k for k, v in VAL_LABELS.items()}
@@ -1425,6 +1502,9 @@ def assets_to_editor(items: list[dict[str, Any]]) -> pd.DataFrame:
         "Birim": a.get("unit") or NO_UNIT,
         "Adet": float(a.get("qty") or 0.0),
         "Birim Maliyet": float(a.get("avg_cost") or 0.0),
+        # Maliyet fiyattan farklı bir para biriminde olabilir: BIST hissesinin
+        # fiyatı TRY iken maliyeti dolar bazlı bir rapordan gelmiş olabilir.
+        "Maliyet Para Birimi": a.get("cost_currency") or a.get("currency", "TRY"),
         "Son Değer": float(a.get("manual_price") or 0.0),
         "Notlar": a.get("notlar", ""),
     } for a in items], columns=EDIT_COLS)
@@ -1476,6 +1556,8 @@ def editor_to_assets(edited: pd.DataFrame) -> tuple[list[dict[str, Any]], list[s
             "unit": unit_raw if unit_raw in METAL_UNITS else None,
             "qty": qty,
             "avg_cost": float(row.get("Birim Maliyet") or 0.0),
+            "cost_currency": (str(row.get("Maliyet Para Birimi") or "").strip().upper()
+                              or str(row.get("Para Birimi") or "TRY").upper()),
             "manual_price": float(row.get("Son Değer") or 0.0) or None,
             "notlar": str(row.get("Notlar") or ""),
         })
@@ -1700,6 +1782,455 @@ def class_series(history: list[dict[str, Any]], days: int | None) -> tuple[list[
     return dates, {c: [r["by_class"].get(c, 0.0) for r in rows] for c in classes}
 
 # ==========================================================================
+# KAYNAK: portfolio/importers.py
+# ==========================================================================
+
+
+import io
+import json
+import math
+import re
+import unicodedata
+from dataclasses import dataclass, field
+from typing import Any
+
+import pandas as pd
+
+
+# --------------------------------------------------------------------------
+# BİRLEŞTİRME KİPLERİ
+# --------------------------------------------------------------------------
+MODE_MERGE = "birlestir"        # eşleşeni güncelle, yeniyi ekle, gerisine dokunma
+MODE_ACCOUNT = "hesap_yenile"   # dosyadaki HESAPLARI tamamen dosyadaki hâline getir
+MODE_REPLACE = "tam_degistir"   # portföyü tamamen dosyadaki hâle getir
+
+MODE_LABELS = {
+    MODE_MERGE: "Birleştir — eşleşenleri güncelle, yenileri ekle, kalanına dokunma",
+    MODE_ACCOUNT: "Hesabı yenile — dosyadaki hesapların ESKİ satırlarını sil, dosyadakini yaz",
+    MODE_REPLACE: "Tamamen değiştir — portföyü dosyadaki hâle getir (en riskli)",
+}
+
+# --------------------------------------------------------------------------
+# BİÇİMLER
+# --------------------------------------------------------------------------
+FMT_AETHER = "aether"
+FMT_MSP = "msp"
+FMT_BLUECOINS = "bluecoins"
+FMT_JSON = "json"
+
+FORMAT_LABELS = {
+    FMT_AETHER: "AETHER tablosu (sembol / adet / maliyet / hesap)",
+    FMT_MSP: "MyStocksPortfolio dışa aktarımı",
+    FMT_BLUECOINS: "Bluecoins hesap dökümü (CSV)",
+    FMT_JSON: "AETHER my_assets.json",
+}
+
+
+class ImportError_(ValueError):
+    """İçe aktarma hatası (yerleşik ImportError ile karışmasın diye alt çizgili)."""
+
+
+# --------------------------------------------------------------------------
+# BAŞLIK EŞLEŞTİRME
+# Türkçe/İngilizce, büyük/küçük, aksanlı/aksansız hepsini kabul eder.
+# --------------------------------------------------------------------------
+def _slug(text: Any) -> str:
+    s = unicodedata.normalize("NFKD", str(text or ""))
+    s = s.replace("ı", "i").replace("İ", "i").replace("ş", "s").replace("Ş", "s")
+    s = s.replace("ğ", "g").replace("Ğ", "g").replace("ü", "u").replace("Ü", "u")
+    s = s.replace("ö", "o").replace("Ö", "o").replace("ç", "c").replace("Ç", "c")
+    s = "".join(c for c in s if not unicodedata.combining(c))
+    return re.sub(r"[^a-z0-9]+", "", s.lower())
+
+
+# alan -> kabul edilen başlıklar (slug hâlinde)
+FIELD_ALIASES: dict[str, tuple[str, ...]] = {
+    "symbol":    ("sembol", "symbol", "kod", "code", "ticker", "fonkodu", "hissekodu"),
+    "qty":       ("adet", "qty", "quantity", "shares", "lot", "miktar", "adetlot",
+                  "birimsayisi", "pay"),
+    "avg_cost":  ("maliyet", "ortalamamaliyet", "ortmaliyet", "avgcost", "cost",
+                  "costbasis", "birimmaliyet", "alisfiyati", "avgprice"),
+    "hesap":     ("hesap", "account", "kurum", "banka", "portfoy", "portfolio",
+                  "broker"),
+    "currency":  ("parabirimi", "currency", "kur", "doviz", "ccy"),
+    # Maliyetin para birimi fiyatınkinden farklı olabilir (BIST hissesi TRY
+    # fiyatlanır ama maliyeti USD raporundan gelmiş olabilir). Ayrı tutulunca
+    # dondurulmuş kur saklamak gerekmez; uygulama canlı kurla çevirir.
+    "cost_currency": ("maliyetparabirimi", "maliyetkuru", "costcurrency",
+                      "costccy", "maliyetdovizi"),
+    "source":    ("kaynak", "source", "fiyatkaynagi"),
+    "ana_sinif": ("anasinif", "anaclass", "assetclass", "sinif", "class"),
+    "alt_sinif": ("altsinif", "altclass", "subclass"),
+    "sektor":    ("sektor", "sector"),
+    "unit":      ("birim", "unit"),
+    "notlar":    ("notlar", "not", "notes", "note", "aciklama", "description"),
+    "deger":     ("deger", "value", "tutar", "marketvalue", "guncel", "guncledeger",
+                  "toplamdeger"),
+}
+
+
+def _column_map(df: pd.DataFrame) -> dict[str, str]:
+    """DataFrame başlıklarını iç alan adlarına eşler."""
+    out: dict[str, str] = {}
+    for col in df.columns:
+        s = _slug(col)
+        for field_name, aliases in FIELD_ALIASES.items():
+            if field_name in out:
+                continue
+            if s in aliases:
+                out[field_name] = col
+                break
+    return out
+
+
+# --------------------------------------------------------------------------
+# SAYI OKUMA — "1.234,56" / "1,234.56" / "$1 234" hepsini çözer
+# --------------------------------------------------------------------------
+_NUM_CLEAN = re.compile(r"[^\d,.\-]")
+
+
+def parse_number(raw: Any) -> float:
+    """Türkçe ve İngilizce sayı biçimlerinin ikisini de okur."""
+    if raw is None:
+        return 0.0
+    if isinstance(raw, (int, float)):
+        return 0.0 if (isinstance(raw, float) and math.isnan(raw)) else float(raw)
+
+    text = _NUM_CLEAN.sub("", str(raw).strip())
+    if not text or text in {"-", ".", ","}:
+        return 0.0
+
+    has_dot, has_comma = "." in text, "," in text
+    if has_dot and has_comma:
+        # Son görülen ayırıcı ondalıktır: "1.234,56" -> virgül, "1,234.56" -> nokta
+        ondalik = "," if text.rfind(",") > text.rfind(".") else "."
+        binlik = "." if ondalik == "," else ","
+        text = text.replace(binlik, "").replace(ondalik, ".")
+    elif has_comma:
+        # Tek virgül: sağında 3 hane ve başka virgül yoksa binlik olabilir.
+        parca = text.split(",")
+        text = ("".join(parca) if len(parca[-1]) == 3 and len(parca) > 2
+                else text.replace(",", "."))
+    elif has_dot:
+        parca = text.split(".")
+        if len(parca) > 2 and all(len(p) == 3 for p in parca[1:]):
+            text = "".join(parca)          # 1.234.567
+    try:
+        return float(text)
+    except ValueError:
+        return 0.0
+
+
+# --------------------------------------------------------------------------
+# DOSYA OKUMA
+# --------------------------------------------------------------------------
+def read_any(data: bytes, filename: str = "") -> pd.DataFrame | list[dict[str, Any]]:
+    """Yüklenen baytları DataFrame'e (veya JSON listesine) çevirir."""
+    ad = (filename or "").lower()
+
+    if ad.endswith(".json") or data[:1].strip() in (b"[", b"{"):
+        try:
+            veri = json.loads(data.decode("utf-8"))
+        except Exception as exc:
+            raise ImportError_(f"JSON okunamadı: {exc}") from exc
+        if isinstance(veri, dict):
+            veri = veri.get("assets") or veri.get("varliklar") or []
+        if not isinstance(veri, list):
+            raise ImportError_("JSON bir varlık listesi içermiyor.")
+        return veri
+
+    if ad.endswith((".xlsx", ".xlsm", ".xls")):
+        try:
+            return pd.read_excel(io.BytesIO(data))
+        except Exception as exc:
+            raise ImportError_(f"Excel okunamadı: {exc}") from exc
+
+    metin = data.decode("utf-8-sig", errors="replace")
+    for ayirici in (None, ";", ",", "\t", "|"):
+        try:
+            df = pd.read_csv(io.StringIO(metin), sep=ayirici,
+                             engine="python" if ayirici is None else "c")
+            if df.shape[1] > 1:
+                return df
+        except Exception:
+            continue
+    raise ImportError_("Dosya CSV/Excel/JSON olarak okunamadı.")
+
+
+def sniff(veri: pd.DataFrame | list[dict[str, Any]]) -> str:
+    """Biçimi tahmin eder."""
+    if isinstance(veri, list):
+        return FMT_JSON
+
+    sluglar = {_slug(c) for c in veri.columns}
+    if {"symbol", "sembol"} & sluglar and {"portfolio", "portfoy"} & sluglar:
+        return FMT_MSP
+    if {"account", "hesap"} & sluglar and not ({"sembol", "symbol"} & sluglar):
+        return FMT_BLUECOINS
+    return FMT_AETHER
+
+
+# --------------------------------------------------------------------------
+# AYRIŞTIRMA
+# --------------------------------------------------------------------------
+def _base_record(sembol: str) -> dict[str, Any]:
+    """Sembolden sınıflandırmayı otomatik doldurur.
+
+    DİKKAT: auto_fill_asset üç harfli her kodu TEFAS fonu sayar; bu doğru
+    davranış (fon kodları üç harflidir) ama ABD sembolleriyle çakışır. Bu
+    yüzden çağıran taraf 'kaynak' sütununu verebilir ve o her zaman kazanır.
+    """
+    try:
+        return auto_fill_asset(sembol)
+    except ValueError as exc:
+        raise ImportError_(f"Geçersiz sembol: {sembol!r}") from exc
+
+
+def parse_table(df: pd.DataFrame, fmt: str = FMT_AETHER,
+                varsayilan_hesap: str = "") -> list[dict[str, Any]]:
+    """Tabloyu normalize edilmiş varlık kayıtlarına çevirir."""
+    if df is None or df.empty:
+        raise ImportError_("Dosya boş.")
+
+    esle = _column_map(df)
+    if "symbol" not in esle:
+        raise ImportError_(
+            "Zorunlu 'Sembol' sütunu bulunamadı. Kabul edilen başlıklar: "
+            + ", ".join(FIELD_ALIASES["symbol"])
+        )
+
+    kayitlar: list[dict[str, Any]] = []
+    for _, satir in df.iterrows():
+        ham = str(satir[esle["symbol"]] or "").strip()
+        if not ham or ham.lower() in {"nan", "none", "-"}:
+            continue
+
+        adet = parse_number(satir[esle["qty"]]) if "qty" in esle else 0.0
+        deger = parse_number(satir[esle["deger"]]) if "deger" in esle else 0.0
+        maliyet = parse_number(satir[esle["avg_cost"]]) if "avg_cost" in esle else 0.0
+
+        # Değeri ve adedi sıfır olan satırlar kapanmış pozisyondur, atlanır.
+        if adet == 0 and deger == 0:
+            continue
+
+        kayit = dict(_base_record(ham))
+        kayit.pop("guessed", None)
+        kayit["qty"] = adet
+        kayit["avg_cost"] = maliyet
+        kayit["hesap"] = (str(satir[esle["hesap"]]).strip()
+                          if "hesap" in esle and pd.notna(satir[esle["hesap"]])
+                          else varsayilan_hesap)
+
+        # Dosyada açıkça verilen alanlar otomatik tahmini EZER.
+        verilen: set[str] = set()
+        for alan in ("currency", "cost_currency", "source", "ana_sinif",
+                     "alt_sinif", "sektor", "unit", "notlar"):
+            if alan in esle and pd.notna(satir[esle[alan]]):
+                deger_ = str(satir[esle[alan]]).strip()
+                if deger_:
+                    kayit[alan] = deger_
+                    verilen.add(alan)
+
+        # Satırda maliyet para birimi YAZILMAMIŞSA maliyet, fiyatın para
+        # biriminde sayılır. Sütunun varlığına değil HÜCRENİN doluluğuna
+        # bakmak şart: sütun var ama hücre boşken otomatik tahminin para
+        # birimi yapışık kalıyordu — "GCL" üç harfli olduğu için TEFAS fonu
+        # sanılıp TRY, "0209.HK" ise ABD hissesi sanılıp USD maliyet alıyordu
+        # ve ikisi de yanlış kurla çevriliyordu.
+        if "cost_currency" not in verilen:
+            kayit["cost_currency"] = kayit["currency"]
+
+        if kayit.get("source") not in VALID_SOURCES:
+            kayit["source"] = SRC_YAHOO
+        if kayit.get("unit") in ("", "Yok", "yok", "-"):
+            kayit["unit"] = None
+        if kayit.get("unit") and kayit["unit"] not in METAL_UNITS:
+            raise ImportError_(
+                f"{ham}: bilinmeyen birim {kayit['unit']!r}. "
+                f"Geçerli birimler: {', '.join(METAL_UNITS)}")
+
+        # Adet yoksa ama toplam değer varsa: kova satırı
+        if adet == 0 and deger > 0:
+            kayit["valuation"] = VAL_VALUE
+            kayit["manual_price"] = deger
+            kayit["avg_cost"] = maliyet or deger
+        else:
+            kayit["valuation"] = VAL_VALUE if kayit["source"] == SRC_MANUAL else VAL_QTY
+
+        kayitlar.append(normalize_asset(kayit))
+
+    if not kayitlar:
+        raise ImportError_("Dosyada içe aktarılacak satır bulunamadı "
+                           "(adet ve değer sütunlarının ikisi de boş olabilir).")
+    return kayitlar
+
+
+def parse_json(veri: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Bir my_assets.json içeriğini doğrular ve normalize eder."""
+    if not isinstance(veri, list):
+        raise ImportError_("JSON bir liste olmalı.")
+    out = []
+    for i, ham in enumerate(veri):
+        if not isinstance(ham, dict):
+            raise ImportError_(f"{i}. kayıt sözlük değil.")
+        if not str(ham.get("symbol", "")).strip():
+            raise ImportError_(f"{i}. kaydın 'symbol' alanı boş.")
+        out.append(normalize_asset(ham))
+    if not out:
+        raise ImportError_("JSON boş bir liste.")
+    return out
+
+
+def parse(veri: pd.DataFrame | list[dict[str, Any]], fmt: str | None = None,
+          varsayilan_hesap: str = "") -> list[dict[str, Any]]:
+    fmt = fmt or sniff(veri)
+    if fmt == FMT_JSON or isinstance(veri, list):
+        return parse_json(veri)          # type: ignore[arg-type]
+    return parse_table(veri, fmt, varsayilan_hesap)
+
+
+# --------------------------------------------------------------------------
+# KARŞILAŞTIRMA
+# --------------------------------------------------------------------------
+# Karşılaştırmada bakılan alanlar (notlar kasten dışarıda: not değişikliği
+# "güncellendi" saydırmasın).
+COMPARE_FIELDS = ("qty", "avg_cost", "currency", "source", "ana_sinif",
+                  "alt_sinif", "sektor", "unit", "valuation", "manual_price")
+
+
+@dataclass
+class Diff:
+    eklenen: list[dict[str, Any]] = field(default_factory=list)
+    guncellenen: list[tuple[dict[str, Any], dict[str, Any]]] = field(default_factory=list)
+    silinen: list[dict[str, Any]] = field(default_factory=list)
+    degismeyen: list[dict[str, Any]] = field(default_factory=list)
+
+    @property
+    def ozet(self) -> str:
+        return (f"{len(self.eklenen)} eklenecek · "
+                f"{len(self.guncellenen)} güncellenecek · "
+                f"{len(self.silinen)} silinecek · "
+                f"{len(self.degismeyen)} değişmeyecek")
+
+    def bos_mu(self) -> bool:
+        return not (self.eklenen or self.guncellenen or self.silinen)
+
+
+def _degisen_alanlar(eski: dict[str, Any], yeni: dict[str, Any]) -> list[str]:
+    farklar = []
+    for alan in COMPARE_FIELDS:
+        a, b = eski.get(alan), yeni.get(alan)
+        if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+            if not math.isclose(float(a), float(b), rel_tol=1e-9, abs_tol=1e-9):
+                farklar.append(alan)
+        elif (a or None) != (b or None):
+            farklar.append(alan)
+    return farklar
+
+
+def diff(mevcut: list[dict[str, Any]], gelen: list[dict[str, Any]],
+         mode: str = MODE_MERGE) -> Diff:
+    """Uygulanmadan ÖNCE ne olacağını hesaplar."""
+    if mode not in MODE_LABELS:
+        raise ImportError_(f"Bilinmeyen kip: {mode}")
+
+    eski_map = {asset_key(a): a for a in mevcut}
+    yeni_map = {asset_key(a): a for a in gelen}
+    gelen_hesaplar = {str(a.get("hesap", "")) for a in gelen}
+
+    d = Diff()
+    for anahtar, yeni in yeni_map.items():
+        eski = eski_map.get(anahtar)
+        if eski is None:
+            d.eklenen.append(yeni)
+        elif _degisen_alanlar(eski, yeni):
+            d.guncellenen.append((eski, yeni))
+        else:
+            d.degismeyen.append(eski)
+
+    for anahtar, eski in eski_map.items():
+        if anahtar in yeni_map:
+            continue
+        if mode == MODE_REPLACE:
+            d.silinen.append(eski)
+        elif mode == MODE_ACCOUNT and str(eski.get("hesap", "")) in gelen_hesaplar:
+            d.silinen.append(eski)
+        else:
+            d.degismeyen.append(eski)
+    return d
+
+
+def apply(mevcut: list[dict[str, Any]], gelen: list[dict[str, Any]],
+          mode: str = MODE_MERGE) -> list[dict[str, Any]]:
+    """diff() ile gösterileni fiilen uygular. Sıra korunur: önce mevcutlar."""
+    d = diff(mevcut, gelen, mode)
+    silinen_anahtarlar = {asset_key(a) for a in d.silinen}
+    yeni_map = {asset_key(a): a for a in gelen}
+
+    out: list[dict[str, Any]] = []
+    goruldu: set[str] = set()
+    for a in mevcut:
+        anahtar = asset_key(a)
+        if anahtar in silinen_anahtarlar:
+            continue
+        out.append(yeni_map.get(anahtar, a))
+        goruldu.add(anahtar)
+    for a in gelen:
+        if asset_key(a) not in goruldu:
+            out.append(a)
+    return out
+
+
+# --------------------------------------------------------------------------
+# ARAYÜZ İÇİN TABLO GÖRÜNÜMÜ
+# --------------------------------------------------------------------------
+def diff_table(d: Diff) -> pd.DataFrame:
+    """Diff'i kullanıcıya gösterilecek tek tabloya çevirir."""
+    satirlar: list[dict[str, Any]] = []
+
+    for a in d.eklenen:
+        satirlar.append({
+            "İşlem": "➕ eklenecek", "Sembol": a.get("display") or a["symbol"],
+            "Hesap": a.get("hesap", ""), "Adet": a.get("qty"),
+            "Maliyet": a.get("avg_cost"), "Değişen alan": "",
+        })
+    for eski, yeni in d.guncellenen:
+        alanlar = _degisen_alanlar(eski, yeni)
+        detay = ", ".join(
+            f"{ad}: {eski.get(ad)!r} → {yeni.get(ad)!r}" for ad in alanlar[:3]
+        ) + (" …" if len(alanlar) > 3 else "")
+        satirlar.append({
+            "İşlem": "✏️ güncellenecek", "Sembol": yeni.get("display") or yeni["symbol"],
+            "Hesap": yeni.get("hesap", ""), "Adet": yeni.get("qty"),
+            "Maliyet": yeni.get("avg_cost"), "Değişen alan": detay,
+        })
+    for a in d.silinen:
+        satirlar.append({
+            "İşlem": "🗑️ silinecek", "Sembol": a.get("display") or a["symbol"],
+            "Hesap": a.get("hesap", ""), "Adet": a.get("qty"),
+            "Maliyet": a.get("avg_cost"), "Değişen alan": "",
+        })
+
+    if not satirlar:
+        return pd.DataFrame(columns=["İşlem", "Sembol", "Hesap", "Adet",
+                                     "Maliyet", "Değişen alan"])
+    return pd.DataFrame(satirlar)
+
+
+def ornek_csv() -> str:
+    """Kullanıcının indirip dolduracağı şablon."""
+    return (
+        "sembol,adet,maliyet,hesap,para_birimi,kaynak,ana_sinif,alt_sinif,sektor,birim,notlar\n"
+        "THYAO.IS,1000,285.50,Midas,TRY,yahoo,Hisse Senedi,BIST,Havacılık,,\n"
+        "NVDA,44,197.97,Midas,USD,yahoo,Hisse Senedi,ABD,Yarı İletken,,\n"
+        "BTC-USD,1.2328,70179.67,Kripto,USD,yahoo,Kripto,Majör,L1 Zincir,,\n"
+        "MAC,254292,0.589873,Yapı Kredi,TRY,tefas,Fon,TEFAS,Hisse Fonu,,\n"
+        "ALTIN,135.37,6551.45,Vakıfbank,TRY,gold,Emtia,Altın,Fiziki Altın,GRAM,\n"
+        "GUMUS,31252.46,87.61,Vakıfbank,TRY,silver,Emtia,Gümüş,Fiziki Gümüş,GRAM,\n"
+        "NAKIT-USD,2111.91,1,İş Bankası,USD,cash,Nakit,Döviz,Dolar,,\n"
+    )
+
+# ==========================================================================
 # KAYNAK: app.py
 # ==========================================================================
 
@@ -1716,7 +2247,7 @@ class _Namespace:
             raise AttributeError(name) from exc
 
 
-an = hist = px = _Namespace()
+an = hist = imp = px = _Namespace()
 
 
 
@@ -2008,7 +2539,13 @@ def snapshot_fingerprint(assets: list[dict]) -> str:
 
 
 def fmt_try(v: float) -> str:
-    return "—" if v != v else f"₺{v:,.0f}"
+    """TRY tutarını KULLANICININ seçtiği para biriminde yazar.
+
+    Ad geriye dönük uyumluluk için 'try' kalıyor; girdi her zaman TRY'dir,
+    çevrim yalnızca sunumda yapılır (bkz. analytics.format_money).
+    """
+    return an.format_money(v, st.session_state.get("goster_para", "TRY"),
+                           globals().get("_fx_now") or {})
 
 
 # ---------------------------------------------------------------------------
@@ -2019,12 +2556,17 @@ if "assets" not in st.session_state:
     st.session_state.assets = load_assets(store)
 assets: list[dict] = st.session_state.assets
 
-head_l, head_r = st.columns([4, 1])
+head_l, head_c, head_r = st.columns([4, 1, 1])
 with head_l:
     st.markdown(
         "<div class='nx-brand'><h1>AETHER NEXUS</h1><span class='tag'>Live</span></div>",
         unsafe_allow_html=True)
+with head_c:
+    st.selectbox("Para birimi", an.DISPLAY_CURRENCIES, key="goster_para",
+                 help="Bütün tutarlar bu para biriminde gösterilir. Hesaplar "
+                      "TRY üzerinden yapılır, çevrim yalnızca sunumdadır.")
 with head_r:
+    st.markdown("<div style='height:1.75rem'></div>", unsafe_allow_html=True)
     if st.button("⚡ Fiyatları Yenile", width="stretch", type="primary"):
         cached_snapshot.clear()
         st.rerun()
@@ -2034,6 +2576,27 @@ with st.spinner("Piyasa verisi çekiliyor…"):
             else px.MarketSnapshot(fetched_at=px._now_istanbul()))
 
 usdtry = snap.usdtry
+# fmt_try() bu sözlüğü globals() üzerinden okur; kur her yenilemede tazelenir.
+_fx_now = snap.fx
+GOSTER = st.session_state.get("goster_para", "TRY")
+PARA_ISARETI = an.CURRENCY_SYMBOLS.get(GOSTER, "")
+
+if GOSTER != "TRY" and an.display_rate(GOSTER, snap.fx) != \
+        an.display_rate(GOSTER, snap.fx):
+    st.warning(
+        f"{GOSTER} kuru çekilemedi; tutarlar TRY olarak gösteriliyor.",
+        icon="⚠️")
+    GOSTER = "TRY"
+    PARA_ISARETI = "₺"
+    st.session_state.goster_para = "TRY"
+
+# 1 TRY kaç <GOSTER> eder. Hesaplar TRY üzerinden yapılır; bu oran yalnızca
+# grafik ve tablolarda SUNUM için kullanılır, tarihçeye TRY yazılmaya devam
+# eder — yoksa para birimini değiştirmek geçmişi bozardı.
+GOSTER_ORAN = an.display_rate(GOSTER, snap.fx)
+if GOSTER_ORAN != GOSTER_ORAN:
+    GOSTER_ORAN = 1.0
+
 meta = [f"Son güncelleme <b>{snap.fetched_at}</b>"]
 meta.append(f"USD/TRY <b>{usdtry:,.2f}</b>" if usdtry else "USD/TRY <b>—</b>")
 if snap.fx.get("EURTRY"):
@@ -2061,18 +2624,22 @@ if not df.empty:
     tone = "pos" if t["kz_try"] >= 0 else "neg"
     sign = "+" if t["kz_try"] >= 0 else "−"
     abs_kz = abs(t["kz_try"])
-    net_usd = (t["net_try"] / usdtry) if usdtry else float("nan")
+    def diger_paralar(try_value: float) -> str:
+        """Seçili olmayan iki para birimindeki karşılığı alt satırda gösterir."""
+        parcalar = [an.format_money(try_value, cur, snap.fx)
+                    for cur in an.DISPLAY_CURRENCIES if cur != GOSTER]
+        return "  ·  ".join(p for p in parcalar if p != "—") or "kur yok"
 
     k1, k2, k3, k4 = st.columns(4)
     k1.markdown(kpi("Varlık Toplamı", fmt_try(t["deger_try"]),
-                    f"${t['deger_usd']:,.0f}" if usdtry else "kur yok"),
+                    diger_paralar(t["deger_try"])),
                 unsafe_allow_html=True)
     k2.markdown(kpi("Net Değer", fmt_try(t["net_try"]),
                     (f"borç {fmt_try(t['borc_try'])}" if t["borc_try"]
                      else "borç yok")
-                    + (f"  ·  ${net_usd:,.0f}" if usdtry else "")),
+                    + f"  ·  {diger_paralar(t['net_try'])}"),
                 unsafe_allow_html=True)
-    k3.markdown(kpi("Kâr / Zarar", f"{sign}₺{abs_kz:,.0f}",
+    k3.markdown(kpi("Kâr / Zarar", f"{sign}{fmt_try(abs_kz)}",
                     f"<span class='badge {tone}'>{sign}%{abs(t['kz_pct']):.2f}</span>"
                     f"&nbsp; maliyet {fmt_try(t['maliyet_try'])}", tone),
                 unsafe_allow_html=True)
@@ -2121,8 +2688,9 @@ if not df.empty and not df["Değer (TRY)"].isna().all():
 # ---------------------------------------------------------------------------
 # SEKMELER
 # ---------------------------------------------------------------------------
-tab_dag, tab_duzen, tab_kova, tab_ekle, tab_ayar = st.tabs(
-    ["Dağılım", "Varlıklar", "Değer Güncelle", "Yeni Varlık", "Ayarlar"])
+tab_dag, tab_duzen, tab_kova, tab_ekle, tab_ice, tab_ayar = st.tabs(
+    ["Dağılım", "Varlıklar", "Değer Güncelle", "Yeni Varlık", "İçe Aktar",
+     "Ayarlar"])
 
 # ============================== DAĞILIM ====================================
 PERIOD_DAYS = {lbl: d for lbl, d in hist.PERIODS}
@@ -2166,21 +2734,23 @@ def render_degisim(history: list[dict]) -> None:
         cmap = an.color_map(list(by_class))
         for name, values in by_class.items():
             fig.add_trace(go.Scatter(
-                x=dates, y=values, name=name, mode="lines",
+                x=dates, y=[v * GOSTER_ORAN for v in values], name=name, mode="lines",
                 stackgroup="one", line=dict(width=0.5, color=cmap[name]),
                 fillcolor=cmap[name],
-                hovertemplate="%{x}<br>" + name + " ₺%{y:,.0f}<extra></extra>"))
+                hovertemplate="%{x}<br>" + name +
+                              f" {PARA_ISARETI}%{{y:,.0f}}<extra></extra>"))
         fig.update_layout(legend=dict(orientation="h", y=-0.18))
     else:
         dates = [r["date"] for r in rows]
-        values = [r["total_try"] for r in rows]
+        values = [r["total_try"] * GOSTER_ORAN for r in rows]
         artis = values[-1] >= values[0]
         renk = an.POS_COLOR if artis else an.NEG_COLOR
         fig.add_trace(go.Scatter(
             x=dates, y=values, mode="lines", line=dict(color=renk, width=2),
             fill="tozeroy",
             fillcolor=an._rgba(renk, 0.12),
-            hovertemplate="%{x}<br>₺%{y:,.0f}<extra></extra>", name="Toplam"))
+            hovertemplate=f"%{{x}}<br>{PARA_ISARETI}%{{y:,.0f}}<extra></extra>",
+            name="Toplam"))
         fig.add_hline(y=values[0], line=dict(color="#3a3a45", width=1, dash="dot"))
         fig.update_layout(showlegend=False)
 
@@ -2202,9 +2772,9 @@ def render_degisim(history: list[dict]) -> None:
         "Başlangıç": c.start_date,
         "Bitiş": c.end_date,
         "Gün": c.days,
-        "Başlangıç Değeri": c.start_value,
-        "Güncel Değer": c.end_value,
-        "Değişim (TRY)": c.delta,
+        "Başlangıç Değeri": c.start_value * GOSTER_ORAN,
+        "Güncel Değer": c.end_value * GOSTER_ORAN,
+        f"Değişim ({GOSTER})": c.delta * GOSTER_ORAN,
         "Değişim %": c.pct_display,
     } for c in changes])
 
@@ -2213,7 +2783,7 @@ def render_degisim(history: list[dict]) -> None:
         column_config={
             "Başlangıç Değeri": st.column_config.NumberColumn(format="%.0f"),
             "Güncel Değer": st.column_config.NumberColumn(format="%.0f"),
-            "Değişim (TRY)": st.column_config.NumberColumn(format="%+.0f"),
+            f"Değişim ({GOSTER})": st.column_config.NumberColumn(format="%+.0f"),
             "Değişim %": st.column_config.NumberColumn(format="%+.2f%%"),
         })
     st.caption(
@@ -2242,13 +2812,15 @@ with tab_dag:
         tm = an.treemap_data(df, levels)
         fig_tm = go.Figure(go.Treemap(
             ids=tm["ids"], labels=tm["labels"], parents=tm["parents"],
-            values=tm["values"], branchvalues="total",
+            values=[v * GOSTER_ORAN for v in tm["values"]],
+            branchvalues="total",
             marker=dict(colors=tm["colors"], line=dict(color="#050506", width=2),
                         cornerradius=6),
             textinfo="label+value+percent parent",
-            texttemplate="<b>%{label}</b><br>₺%{value:,.0f}<br>%{percentParent}",
+            texttemplate=("<b>%{label}</b><br>" + PARA_ISARETI +
+                          "%{value:,.0f}<br>%{percentParent}"),
             textfont=dict(size=13, color="#ececf1"),
-            hovertemplate="<b>%{id}</b><br>₺%{value:,.0f}"
+            hovertemplate="<b>%{id}</b><br>" + PARA_ISARETI + "%{value:,.0f}"
                           "<br>Üst grubun %{percentParent} kadarı<extra></extra>",
             pathbar=dict(visible=True, thickness=22),
         ))
@@ -2262,12 +2834,14 @@ with tab_dag:
             keys = list(alloc[LEVEL_COLS["ana_sinif"]].astype(str))
             cmap = an.color_map(keys)
             donut = go.Figure(go.Pie(
-                labels=keys, values=alloc["Değer (TRY)"], hole=0.62, sort=False,
+                labels=keys, values=alloc["Değer (TRY)"] * GOSTER_ORAN,
+                hole=0.62, sort=False,
                 marker=dict(colors=[cmap[k] for k in keys],
                             line=dict(color="#050506", width=2)),
                 textinfo="percent", textposition="inside",
                 insidetextfont=dict(size=12, color="#ffffff"),
-                hovertemplate="%{label}<br>₺%{value:,.0f} (%{percent})<extra></extra>",
+                hovertemplate=("%{label}<br>" + PARA_ISARETI +
+                               "%{value:,.0f} (%{percent})<extra></extra>"),
             ))
             donut.update_layout(
                 height=380, showlegend=True,
@@ -2283,11 +2857,13 @@ with tab_dag:
             bar_df = df.dropna(subset=["Değer (TRY)"]).head(15).iloc[::-1]
             top_map = an.color_map(list(an.allocation(df, "Ana Sınıf")["Ana Sınıf"]))
             bar = go.Figure(go.Bar(
-                x=bar_df["Değer (TRY)"], y=bar_df["Etiket"], orientation="h",
+                x=bar_df["Değer (TRY)"] * GOSTER_ORAN, y=bar_df["Etiket"],
+                orientation="h",
                 marker=dict(color=[top_map.get(c, an.OTHER_COLOR)
                                    for c in bar_df["Ana Sınıf"]],
                             cornerradius=4),
-                hovertemplate="%{y}<br>₺%{x:,.0f}<extra></extra>",
+                hovertemplate=("%{y}<br>" + PARA_ISARETI +
+                               "%{x:,.0f}<extra></extra>"),
             ))
             bar.update_layout(
                 height=380, bargap=0.32,
@@ -2304,11 +2880,14 @@ with tab_dag:
                 node=dict(pad=16, thickness=14, line=dict(color="#050506", width=1),
                           label=sk["labels"], color=sk["node_colors"],
                           customdata=sk["paths"],
-                          hovertemplate="%{customdata}<br>₺%{value:,.0f}<extra></extra>"),
-                link=dict(source=sk["source"], target=sk["target"], value=sk["value"],
+                          hovertemplate=("%{customdata}<br>" + PARA_ISARETI +
+                                         "%{value:,.0f}<extra></extra>")),
+                link=dict(source=sk["source"], target=sk["target"],
+                          value=[v * GOSTER_ORAN for v in sk["value"]],
                           color=sk["link_colors"],
                           hovertemplate="%{source.label} → %{target.label}"
-                                        "<br>₺%{value:,.0f}<extra></extra>"),
+                                        "<br>" + PARA_ISARETI +
+                                        "%{value:,.0f}<extra></extra>"),
             ))
             fig_sk.update_layout(height=110 + 30 * max(6, len(sk["labels"])),
                                  **CHART_LAYOUT)
@@ -2317,9 +2896,11 @@ with tab_dag:
         with st.expander("Dağılım tabloları"):
             for lvl in levels:
                 st.markdown(f"**{lvl}**")
-                st.dataframe(an.allocation(df, lvl), width="stretch",
+                st.dataframe(an.convert_columns(an.allocation(df, lvl),
+                                                GOSTER, snap.fx),
+                             width="stretch",
                              hide_index=True,
-                             column_config={"Değer (TRY)": st.column_config.NumberColumn(
+                             column_config={f"Değer ({GOSTER})": st.column_config.NumberColumn(
                                  format="%.0f"),
                                  "Pay %": st.column_config.NumberColumn(format="%.2f%%")})
 
@@ -2364,8 +2945,13 @@ with tab_duzen:
                 help="Sadece altın/gümüş için; diğerlerinde 'Yok'"),
             "Adet": st.column_config.NumberColumn(format="%.4f", min_value=0.0),
             "Birim Maliyet": st.column_config.NumberColumn(
-                format="%.2f", min_value=0.0,
+                format="%.4f", min_value=0.0,
                 help="Canlı modda birim maliyet, kova modunda toplam maliyet"),
+            "Maliyet Para Birimi": st.column_config.SelectboxColumn(
+                options=CURRENCIES, width="small", required=True,
+                help="Maliyet fiyattan farklı para biriminde olabilir: BIST "
+                     "hissesinin fiyatı TRY iken maliyeti USD olabilir. "
+                     "Çevrim her açılışta güncel kurla yapılır."),
             "Son Değer": st.column_config.NumberColumn(
                 format="%.2f", min_value=0.0,
                 help="Adet girilmediğinde kullanılan güncel toplam tutar"),
@@ -2392,16 +2978,17 @@ with tab_duzen:
 
     if not df.empty:
         section("Hesaplanmış görünüm")
-        view = df[["Sembol", "Ana Sınıf", "Alt Sınıf", "Sektör", "Değerleme",
-                   "Para Birimi", "Adet", "Fiyat", "K/Z %", "Değer (TRY)",
-                   "Ağırlık %", "Hata"]]
+        view = an.convert_columns(
+            df[["Sembol", "Ana Sınıf", "Alt Sınıf", "Sektör", "Değerleme",
+                "Para Birimi", "Maliyet Para Birimi", "Adet", "Fiyat", "K/Z %",
+                "Değer (TRY)", "Ağırlık %", "Hata"]], GOSTER, snap.fx)
         st.dataframe(
             view, width="stretch", hide_index=True,
             column_config={
                 "Adet": st.column_config.NumberColumn(format="%.4f"),
                 "Fiyat": st.column_config.NumberColumn(format="%.4f"),
                 "K/Z %": st.column_config.NumberColumn(format="%.2f%%"),
-                "Değer (TRY)": st.column_config.NumberColumn(format="%.0f"),
+                f"Değer ({GOSTER})": st.column_config.NumberColumn(format="%.0f"),
                 "Ağırlık %": st.column_config.ProgressColumn(
                     format="%.1f%%", min_value=0.0,
                     max_value=float(df["Ağırlık %"].max(skipna=True) or 100)),
@@ -2625,6 +3212,92 @@ with tab_ekle:
                         st.rerun()
 
 # ============================== AYARLAR ====================================
+with tab_ice:
+    section("Dosyadan içe aktar")
+    st.caption(
+        "Bluecoins, MyStocksPortfolio ya da bankanızdan aldığınız dökümü "
+        "tabloya çevirip yükleyin. **Hiçbir şey siz önizlemeyi onaylamadan "
+        "değişmez.**")
+
+    ia_ust = st.columns([3, 2])
+    ia_dosya = ia_ust[0].file_uploader(
+        "CSV, Excel veya JSON", type=["csv", "xlsx", "xlsm", "xls", "json"],
+        key="ia_upload")
+    ia_ust[1].download_button(
+        "⬇️ Boş şablon indir (CSV)", imp.ornek_csv().encode("utf-8"),
+        "aether_sablon.csv", "text/csv", width="stretch")
+    ia_ust[1].caption(
+        "Zorunlu tek sütun **sembol**. Diğerleri boş bırakılırsa otomatik "
+        "doldurulur.")
+
+    if ia_dosya is None:
+        with st.expander("Sütun başlıkları nasıl yazılmalı?"):
+            st.markdown(
+                "Başlıklar Türkçe/İngilizce, büyük/küçük harf ve aksan farkı "
+                "gözetilmeden tanınır. Sayılarda hem `1.234,56` hem "
+                "`1,234.56` biçimi okunur.")
+            st.dataframe(pd.DataFrame(
+                [{"Alan": ia_alan, "Kabul edilen başlıklar": ", ".join(ia_adlar)}
+                 for ia_alan, ia_adlar in imp.FIELD_ALIASES.items()]),
+                width="stretch", hide_index=True)
+    else:
+        try:
+            ia_ham = imp.read_any(ia_dosya.getvalue(), ia_dosya.name)
+            ia_bulunan = imp.sniff(ia_ham)
+
+            ia_orta = st.columns([2, 2, 3])
+            ia_fmt = ia_orta[0].selectbox(
+                "Biçim", list(imp.FORMAT_LABELS),
+                index=list(imp.FORMAT_LABELS).index(ia_bulunan),
+                format_func=lambda k: imp.FORMAT_LABELS[k], key="ia_fmt")
+            ia_hesap = ia_orta[1].text_input(
+                "Varsayılan hesap", value="",
+                help="Dosyada 'hesap' sütunu yoksa bütün satırlara bu yazılır.",
+                key="ia_hesap")
+            ia_mod = ia_orta[2].radio(
+                "Birleştirme kipi", list(imp.MODE_LABELS),
+                format_func=lambda k: imp.MODE_LABELS[k], key="ia_mod")
+
+            ia_gelen = imp.parse(ia_ham, ia_fmt, ia_hesap.strip())
+            ia_fark = imp.diff(assets, ia_gelen, ia_mod)
+
+            section("Önizleme")
+            st.markdown(f"**{len(ia_gelen)} satır okundu** — {ia_fark.ozet}")
+
+            if ia_fark.silinen:
+                st.warning(
+                    f"Bu kip **{len(ia_fark.silinen)} satırı silecek**. "
+                    "Aşağıdaki listede beklemediğiniz bir şey varsa kipi "
+                    "değiştirin.")
+
+            ia_tablo = imp.diff_table(ia_fark)
+            if ia_tablo.empty:
+                st.info("Dosya portföyle birebir aynı — değişecek bir şey yok.")
+            else:
+                st.dataframe(ia_tablo, width="stretch", hide_index=True)
+
+            if not ia_fark.bos_mu():
+                st.caption(
+                    "Uygulamadan önce **Ayarlar → Yedek → my_assets.json "
+                    "indir** ile bir kopya almanız önerilir.")
+                if st.button("✅ Bu değişiklikleri uygula", type="primary",
+                             key="ia_uygula"):
+                    st.session_state.assets = imp.apply(
+                        assets, ia_gelen, ia_mod)
+                    if save_assets(store, st.session_state.assets,
+                                   f"içe aktarma ({ia_dosya.name})"):
+                        cached_snapshot.clear()
+                        st.session_state.editor_version = \
+                            st.session_state.get("editor_version", 0) + 1
+                        st.success(
+                            f"Uygulandı — {ia_fark.ozet}. "
+                            f"Portföy {len(st.session_state.assets)} satır.")
+                        st.rerun()
+        except imp.ImportError_ as exc:
+            st.error(f"Dosya okunamadı: {exc}")
+        except Exception as exc:  # beklenmeyen hata portföyü bozmasın
+            st.error(f"Beklenmeyen hata: {exc}")
+
 with tab_ayar:
     section("Depolama")
     st.code(store.describe(), language="text")

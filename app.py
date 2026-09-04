@@ -610,12 +610,50 @@ def _tefas_session() -> requests.Session:
     return s
 
 
+# TEFAS fonları üç tipe ayırır ve BindHistoryInfo bu filtreyi ZORUNLU sayar:
+#   YAT -> yatırım fonları (hisse, borçlanma, altın, serbest, fon sepeti…)
+#   EMK -> emeklilik (BES) fonları
+#   BYF -> borsa yatırım fonları
+# Eski kod yalnızca "YAT" soruyordu; diğer iki tipteki fonlar hiç bulunamıyordu.
+TEFAS_FON_TIPLERI = ("YAT", "EMK", "BYF")
+
+
+def _tefas_rows(session, fontip: str, start, end, timeout: int) -> list[dict]:
+    """Bir fon tipi için tarih aralığındaki TÜM satırları tek istekte alır."""
+    payload = {
+        "fontip": fontip,
+        "sfontur": "",
+        "fonkod": "",            # boş -> o tipteki bütün fonlar
+        "fongrup": "",
+        "bastarih": start.strftime("%d.%m.%Y"),
+        "bittarih": end.strftime("%d.%m.%Y"),
+        "fonturkod": "",
+        "fonunvantip": "",
+        "strperiod": "1,1,1,1,1,1,1",
+        "islemdurum": "1",
+    }
+    resp = session.post(TEFAS_URL, data=payload, timeout=timeout)
+    resp.raise_for_status()
+    return (resp.json() or {}).get("data") or []
+
+
 def fetch_tefas(codes: Iterable[str], *, lookback_days: int = 15,
-                timeout: int = 20) -> dict[str, float]:
+                timeout: int = 20,
+                errors: list[str] | None = None) -> dict[str, float]:
     """
     TEFAS fon fiyatlarını sitenin kendi API'sinden çeker.
-    Dönen JSON: {"data": [{"TARIH": <epoch_ms>, "FONKODU": "MAC", "FIYAT": 12.34, ...}]}
-    Her fon için en güncel tarihli FIYAT alınır.
+
+    İKİ ÖNEMLİ DEĞİŞİKLİK
+    ---------------------
+    1) TOPLU İSTEK. Eskiden her fon için ayrı POST atılıyordu; 21 fonluk bir
+       portföyde bu 21 ardışık istek (en kötü ihtimalle 21x20 sn) demekti ve
+       tek bir yavaşlama bütün fonları düşürüyordu. Artık fon tipi başına tek
+       istek atılıp sonuç yerelde filtreleniyor: en fazla 3 istek.
+    2) ÜÇ FON TİPİ. "fontip" eskiden "YAT" sabitti; emeklilik (EMK) ve borsa
+       yatırım fonları (BYF) hiçbir zaman bulunamıyordu.
+
+    `errors` verilirse başarısızlığın GERÇEK sebebi (HTTP kodu / istisna)
+    oraya yazılır — kullanıcıya "bulunamadı" yerine nedenini gösterebilmek için.
     """
     codes = sorted({c.strip().upper() for c in codes if c and c.strip()})
     if not codes:
@@ -629,36 +667,47 @@ def fetch_tefas(codes: Iterable[str], *, lookback_days: int = 15,
 
     end = dt.date.today()
     start = end - dt.timedelta(days=lookback_days)
-    out: dict[str, float] = {}
 
-    for code in codes:
-        payload = {
-            "fontip": "YAT",
-            "sfontur": "",
-            "fonkod": code,
-            "fongrup": "",
-            "bastarih": start.strftime("%d.%m.%Y"),
-            "bittarih": end.strftime("%d.%m.%Y"),
-            "fonturkod": "",
-            "fonunvantip": "",
-            "strperiod": "1,1,1,1,1,1,1",
-            "islemdurum": "1",
-        }
+    aranan = set(codes)
+    en_guncel: dict[str, tuple[int, float]] = {}
+    sorunlar: list[str] = []
+
+    for fontip in TEFAS_FON_TIPLERI:
+        if not aranan - set(en_guncel):
+            break                       # hepsi bulundu, kalan tipleri sorma
         try:
-            resp = session.post(TEFAS_URL, data=payload, timeout=timeout)
-            resp.raise_for_status()
-            rows = (resp.json() or {}).get("data") or []
-            rows = [r for r in rows if r.get("FIYAT") not in (None, "")]
-            if not rows:
-                continue
-            rows.sort(key=lambda r: r.get("TARIH") or 0)
-            price = float(str(rows[-1]["FIYAT"]).replace(",", "."))
-            if price > 0:
-                out[code] = price
+            rows = _tefas_rows(session, fontip, start, end, timeout)
         except Exception as exc:
-            log.warning("TEFAS fiyatı alınamadı (%s): %s", code, exc)
+            sorunlar.append(f"{fontip}: {type(exc).__name__}: {str(exc)[:120]}")
+            log.warning("TEFAS %s isteği başarısız: %s", fontip, exc)
+            continue
 
-    return out
+        for r in rows:
+            kod = str(r.get("FONKODU") or "").strip().upper()
+            if kod not in aranan:
+                continue
+            ham = r.get("FIYAT")
+            if ham in (None, ""):
+                continue
+            try:
+                fiyat = float(str(ham).replace(",", "."))
+            except ValueError:
+                continue
+            if fiyat <= 0:
+                continue
+            tarih = int(r.get("TARIH") or 0)
+            onceki = en_guncel.get(kod)
+            if onceki is None or tarih >= onceki[0]:
+                en_guncel[kod] = (tarih, fiyat)
+
+    if errors is not None and sorunlar:
+        errors.extend(sorunlar)
+
+    eksik = sorted(aranan - set(en_guncel))
+    if eksik:
+        log.warning("TEFAS'ta bulunamayan kodlar: %s", ", ".join(eksik))
+
+    return {kod: fiyat for kod, (_, fiyat) in en_guncel.items()}
 
 
 # ---------------------------------------------------------------------------
@@ -713,9 +762,10 @@ def build_snapshot(assets: list[dict[str, Any]]) -> MarketSnapshot:
         snap.errors.append("Gümüş ons fiyatı (SI=F) çekilemedi.")
 
     tefas_prices: dict[str, float] = {}
+    tefas_errors: list[str] = []
     if tefas_codes:
         try:
-            tefas_prices = fetch_tefas(tefas_codes)
+            tefas_prices = fetch_tefas(tefas_codes, errors=tefas_errors)
         except Exception as exc:
             snap.errors.append(f"TEFAS'a ulaşılamadı: {exc}")
         # Sadece değeri fiyata BAĞLI olan satırlar için uyar; kova satırlarının
@@ -725,9 +775,21 @@ def build_snapshot(assets: list[dict[str, Any]]) -> MarketSnapshot:
                     and a.get("valuation") != "value"}
         missing = (tefas_codes & critical) - set(tefas_prices)
         if missing:
-            snap.errors.append(
-                "TEFAS fiyatı bulunamadı: " + ", ".join(sorted(missing))
-            )
+            # Sebebi de söyle: "bulunamadı" tek başına, TEFAS'a hiç
+            # ulaşılamadığı durumla kodun yanlış olduğu durumu ayırt ettirmiyor.
+            if tefas_errors and not tefas_prices:
+                snap.errors.append(
+                    "TEFAS'a ulaşılamadı, hiçbir fon fiyatı çekilemedi "
+                    f"({len(missing)} fon). Sebep — {tefas_errors[0]}")
+            elif tefas_errors:
+                snap.errors.append(
+                    "TEFAS kısmen yanıt verdi; şu fonlar alınamadı: "
+                    + ", ".join(sorted(missing))
+                    + f". Sebep — {tefas_errors[0]}")
+            else:
+                snap.errors.append(
+                    "TEFAS bu kodları tanımadı (fon kodu yanlış ya da fon "
+                    "kapanmış olabilir): " + ", ".join(sorted(missing)))
 
     for asset in assets:
         sym = asset["symbol"]
@@ -964,28 +1026,52 @@ class Storage:
             "committer": {"name": self.committer_name, "email": self.committer_email},
         }
 
-        for attempt in range(2):
+        # sha ile ilgili KURTARILABİLİR hatalar:
+        #   409 -> başka bir yerden commit gelmiş, elimizdeki sha eskimiş
+        #   422 -> dosya depoda VAR ama sha göndermedik ("sha wasn't supplied").
+        #          Bu, dosya uygulama dışından (elle upload) eklendiğinde ya da
+        #          bu Storage örneği hiç load() etmeden save()'e geldiğinde olur.
+        # İkisinin de çaresi aynı: sha'yı GET ile tazeleyip tekrar denemek.
+        # Eskiden yalnız 409 ele alınıyordu, bu yüzden depoya elle yüklenen
+        # portfolio_history.json ilk kayıtta 422 verip uygulamayı düşürüyordu.
+        SHA_HATALARI = (409, 422)
+        son_hata = ""
+
+        for attempt in range(3):
             if self._sha:
                 payload["sha"] = self._sha
             else:
                 payload.pop("sha", None)
-            r = requests.put(self._url(), headers=self._headers(),
-                             json=payload, timeout=25)
+            try:
+                r = requests.put(self._url(), headers=self._headers(),
+                                 json=payload, timeout=25)
+            except requests.RequestException as exc:
+                # Ağ hatası da StorageError olmalı; yoksa çağıranın
+                # `except StorageError` bloğu yakalayamaz ve uygulama düşer.
+                raise StorageError(f"GitHub'a bağlanılamadı: {exc}") from exc
+
             if r.status_code in (200, 201):
                 self._sha = (r.json().get("content") or {}).get("sha")
                 return self._sha or "ok"
-            if r.status_code == 409 and attempt == 0:
-                # Başka bir yerden commit gelmiş; sha'yı tazeleyip bir kez daha dene
-                log.info("GitHub 409 çakışması, sha tazeleniyor.")
+
+            son_hata = f"HTTP {r.status_code}: {r.text[:300]}"
+
+            if r.status_code in SHA_HATALARI and attempt < 2:
+                log.info("GitHub %s, sha tazeleniyor.", r.status_code)
+                self._sha = None
                 try:
-                    self.load()
-                except StorageError:
-                    pass
+                    self.load()          # _sha'yı günceller
+                except StorageError as exc:
+                    log.info("sha tazelenemedi: %s", exc)
+                if not self._sha:
+                    # Dosya gerçekten yoksa sha'sız deneme doğru olan.
+                    log.info("sha alınamadı; sha'sız yazma denenecek.")
                 continue
-            raise StorageError(
-                f"GitHub'a yazılamadı (HTTP {r.status_code}): {r.text[:300]}"
-            )
-        raise StorageError("GitHub'a yazılamadı: çakışma çözülemedi.")
+
+            raise StorageError(f"GitHub'a yazılamadı ({son_hata})")
+
+        raise StorageError(f"GitHub'a yazılamadı, sha çakışması çözülemedi "
+                           f"({son_hata})")
 
 
 def storage_from_secrets(secrets: Any, local_path: str = DEFAULT_PATH) -> Storage:
@@ -2680,10 +2766,15 @@ if not df.empty and not df["Değer (TRY)"].isna().all():
         if _changed:
             st.session_state.history = _new_hist
             history = _new_hist
+            # Tarihçe kaydı YARDIMCI bir işlevdir; başarısız olması uygulamayı
+            # ASLA düşürmemeli. Bu yüzden StorageError değil Exception
+            # yakalıyoruz: ağ hatası, JSON hatası, izin hatası — hepsi burada
+            # kalsın, portföy görüntülenmeye devam etsin.
             try:
                 hist_store.save(_new_hist, "günlük değer kaydı")
-            except StorageError as exc:
-                st.caption(f"⚠️ Tarihçe kaydedilemedi: {exc}")
+            except Exception as exc:                      # noqa: BLE001
+                st.caption(f"⚠️ Tarihçe kaydedilemedi (portföy etkilenmedi): "
+                           f"{type(exc).__name__}: {exc}")
 
 # ---------------------------------------------------------------------------
 # SEKMELER

@@ -483,7 +483,15 @@ YAHOO_FX = {"USDTRY": "TRY=X", "EURTRY": "EURTRY=X", "EURUSD": "EURUSD=X",
 YAHOO_GOLD = "GC=F"      # Altın vadeli, USD/ons
 YAHOO_SILVER = "SI=F"    # Gümüş vadeli, USD/ons
 
-TEFAS_URL = "https://www.tefas.gov.tr/api/DB/BindHistoryInfo"
+# TEFAS 2026'da altyapısını yeniledi: eski /api/DB/BindHistoryInfo uç noktası
+# artık 404 veriyor ve HTML kazımaya dayalı bütün çözümler de kırıldı.
+# Yeni uç nokta JSON gövde alıyor, tarihleri YYYYAAGG yazıyor ve alan adları
+# camelCase (fonKodu / tarih / fiyat). Eskisini yine de son çare olarak
+# deniyoruz: TEFAS geri alırsa ya da bir vekil sunucu hâlâ sunuyorsa çalışsın.
+TEFAS_URL_YENI = "https://www.tefas.gov.tr/api/funds/fonGnlBlgSiraliGetir"
+TEFAS_REFERER_YENI = "https://www.tefas.gov.tr/tr/fon-verileri"
+
+TEFAS_URL = "https://www.tefas.gov.tr/api/DB/BindHistoryInfo"   # eski (404)
 TEFAS_REFERER = "https://www.tefas.gov.tr/TarihselVeriler.aspx"
 
 
@@ -618,12 +626,75 @@ def _tefas_session() -> requests.Session:
 TEFAS_FON_TIPLERI = ("YAT", "EMK", "BYF")
 
 
-def _tefas_rows(session, fontip: str, start, end, timeout: int) -> list[dict]:
-    """Bir fon tipi için tarih aralığındaki TÜM satırları tek istekte alır."""
+# Yanıttaki alan adları sürümden sürüme değişebiliyor (FONKODU / fonKodu /
+# fonkod ...). Tek bir yazıma bağlanmak yerine adayları sırayla deniyoruz;
+# karşılaştırma küçük harfe indirgenerek yapılır.
+_TEFAS_ALAN = {
+    "kod":   ("fonkodu", "fonkod", "kod", "code", "fund_code"),
+    "fiyat": ("fiyat", "birimpaydegeri", "price", "sonfiyat"),
+    "tarih": ("tarih", "date", "islemtarihi"),
+}
+
+
+def _tefas_sayi(ham) -> float | None:
+    """TEFAS fiyatı sayı ya da metin ('1,4318' / '1.234,56') gelebilir."""
+    if ham is None or ham == "":
+        return None
+    if isinstance(ham, (int, float)):
+        return float(ham)
+    metin = str(ham).strip()
+    if "," in metin and "." in metin:
+        metin = metin.replace(".", "").replace(",", ".")   # 1.234,56
+    elif "," in metin:
+        metin = metin.replace(",", ".")                    # 1,4318
+    try:
+        return float(metin)
+    except ValueError:
+        return None
+
+
+def _alan(satir: dict, hangi: str):
+    """Satırdan alanı, adı nasıl yazılmış olursa olsun okur."""
+    kucuk = {str(k).lower().replace("_", ""): v for k, v in satir.items()}
+    for aday in _TEFAS_ALAN[hangi]:
+        if aday in kucuk and kucuk[aday] not in (None, ""):
+            return kucuk[aday]
+    return None
+
+
+def _tefas_rows_yeni(session, fontip: str, start, end, timeout: int,
+                     fon_kodu: str | None = None) -> list[dict]:
+    """Yeni JSON API. fon_kodu None ise o tipteki bütün fonlar döner."""
+    payload = {
+        "fonTipi": fontip,
+        "fonKodu": fon_kodu,
+        "basTarih": start.strftime("%Y%m%d"),     # yeni API 8 haneli yazıyor
+        "bitTarih": end.strftime("%Y%m%d"),
+        "basSira": 1,
+        "bitSira": 100000,
+        "dil": "TR",
+        "aramaMetni": None, "fonTurKod": None, "fonGrubu": None,
+        "sfonTurKod": None, "fonTurAciklama": None, "kurucuKod": None,
+        "sFonTurKod": "", "fonKod": "", "fonGrup": "", "fonUnvanTip": "",
+    }
+    resp = session.post(TEFAS_URL_YENI, json=payload, timeout=timeout,
+                        headers={"Content-Type": "application/json",
+                                 "Referer": TEFAS_REFERER_YENI,
+                                 "Accept": "*/*"})
+    resp.raise_for_status()
+    veri = resp.json() or {}
+    if veri.get("errorCode"):
+        raise RuntimeError(f"TEFAS hata {veri['errorCode']}: "
+                           f"{veri.get('errorMessage', '')}")
+    return veri.get("resultList") or veri.get("data") or []
+
+
+def _tefas_rows_eski(session, fontip: str, start, end, timeout: int) -> list[dict]:
+    """Eski form-encoded API (2026 yenilemesinden önce). Son çare."""
     payload = {
         "fontip": fontip,
         "sfontur": "",
-        "fonkod": "",            # boş -> o tipteki bütün fonlar
+        "fonkod": "",
         "fongrup": "",
         "bastarih": start.strftime("%d.%m.%Y"),
         "bittarih": end.strftime("%d.%m.%Y"),
@@ -635,6 +706,11 @@ def _tefas_rows(session, fontip: str, start, end, timeout: int) -> list[dict]:
     resp = session.post(TEFAS_URL, data=payload, timeout=timeout)
     resp.raise_for_status()
     return (resp.json() or {}).get("data") or []
+
+
+def _tefas_rows(session, fontip: str, start, end, timeout: int) -> list[dict]:
+    """Önce yeni API, olmazsa eski API. Geriye dönük uyumluluk için korunuyor."""
+    return _tefas_rows_yeni(session, fontip, start, end, timeout)
 
 
 def fetch_tefas(codes: Iterable[str], *, lookback_days: int = 15,
@@ -669,36 +745,60 @@ def fetch_tefas(codes: Iterable[str], *, lookback_days: int = 15,
     start = end - dt.timedelta(days=lookback_days)
 
     aranan = set(codes)
-    en_guncel: dict[str, tuple[int, float]] = {}
+    en_guncel: dict[str, tuple[float, float]] = {}
     sorunlar: list[str] = []
 
-    for fontip in TEFAS_FON_TIPLERI:
-        if not aranan - set(en_guncel):
-            break                       # hepsi bulundu, kalan tipleri sorma
-        try:
-            rows = _tefas_rows(session, fontip, start, end, timeout)
-        except Exception as exc:
-            sorunlar.append(f"{fontip}: {type(exc).__name__}: {str(exc)[:120]}")
-            log.warning("TEFAS %s isteği başarısız: %s", fontip, exc)
-            continue
-
+    def isle(rows) -> None:
         for r in rows:
-            kod = str(r.get("FONKODU") or "").strip().upper()
+            if not isinstance(r, dict):
+                continue
+            kod = str(_alan(r, "kod") or "").strip().upper()
             if kod not in aranan:
                 continue
-            ham = r.get("FIYAT")
-            if ham in (None, ""):
+            fiyat = _tefas_sayi(_alan(r, "fiyat"))
+            if fiyat is None or fiyat <= 0:
                 continue
             try:
-                fiyat = float(str(ham).replace(",", "."))
+                tarih = float(str(_alan(r, "tarih") or 0).replace("-", "")
+                              .replace(".", "").replace("/", "")[:14] or 0)
             except ValueError:
-                continue
-            if fiyat <= 0:
-                continue
-            tarih = int(r.get("TARIH") or 0)
+                tarih = 0.0
             onceki = en_guncel.get(kod)
             if onceki is None or tarih >= onceki[0]:
                 en_guncel[kod] = (tarih, fiyat)
+
+    # 1) YENİ API — fon tipi başına tek toplu istek
+    for fontip in TEFAS_FON_TIPLERI:
+        if not aranan - set(en_guncel):
+            break
+        try:
+            isle(_tefas_rows_yeni(session, fontip, start, end, timeout))
+        except Exception as exc:
+            sorunlar.append(f"yeni API/{fontip}: {type(exc).__name__}: "
+                            f"{str(exc)[:110]}")
+            log.warning("TEFAS yeni API %s başarısız: %s", fontip, exc)
+
+    # 2) Toplu istek bazılarını getirmediyse tek tek sor (fon tipi bilinmiyor
+    #    olabilir ya da toplu sonuç kırpılmış olabilir).
+    for kod in sorted(aranan - set(en_guncel)):
+        for fontip in TEFAS_FON_TIPLERI:
+            try:
+                isle(_tefas_rows_yeni(session, fontip, start, end, timeout,
+                                      fon_kodu=kod))
+            except Exception as exc:
+                log.info("TEFAS tekil %s/%s: %s", kod, fontip, exc)
+            if kod in en_guncel:
+                break
+
+    # 3) Son çare: eski form-encoded API (TEFAS geri alırsa çalışsın)
+    if aranan - set(en_guncel):
+        for fontip in TEFAS_FON_TIPLERI:
+            if not aranan - set(en_guncel):
+                break
+            try:
+                isle(_tefas_rows_eski(session, fontip, start, end, timeout))
+            except Exception as exc:
+                log.info("TEFAS eski API %s: %s", fontip, exc)
 
     if errors is not None and sorunlar:
         errors.extend(sorunlar)
@@ -2467,12 +2567,20 @@ st.markdown(
        Koyu zeminde ikincil butonlar varsayılan olarak siyah üstüne siyah
        kalıyordu; ancak imleç üzerine gelince görünüyorlardı. Hepsine görünür
        bir yüzey, kenarlık ve açık yazı rengi veriyoruz. */
+    /* Seçici listesi Streamlit sürümüne göre değişiyor; hem eski sınıf
+       adlarını hem yeni data-testid'leri hem de çıplak <button>'ları
+       hedefliyoruz. Asıl çözüm .streamlit/config.toml'daki koyu tema —
+       bu kurallar o dosya olmasa da butonlar kaybolmasın diye var. */
     .stButton > button,
     .stDownloadButton > button,
     .stFormSubmitButton > button,
+    .stPopover > button,
     [data-testid="stBaseButton-secondary"],
     [data-testid="stBaseButton-secondaryFormSubmit"],
-    [data-testid="stFileUploaderDropzone"] button {
+    [data-testid="stBaseButton-borderless"],
+    [data-testid="stFileUploaderDropzone"] button,
+    [data-testid="stExpander"] summary,
+    div[data-testid="stVerticalBlock"] button:not([kind="primary"]) {
       background: var(--surface-2) !important;
       color: var(--ink) !important;
       border: 1px solid #2b2b36 !important;
@@ -2487,6 +2595,22 @@ st.markdown(
       border-color: var(--accent) !important;
       color: var(--accent) !important;
     }
+
+    /* Açılır menü, radyo, sayı ve metin kutuları: config.toml yoksa
+       Streamlit bunları AÇIK temayla çizer ve siyah zeminde kaybolurlar. */
+    [data-baseweb="select"] > div,
+    [data-baseweb="input"] > div,
+    .stTextInput input, .stNumberInput input, .stDateInput input {
+      background: var(--surface-2) !important;
+      border-color: #2b2b36 !important;
+      color: var(--ink) !important;
+    }
+    [data-baseweb="select"] svg { fill: var(--ink-2) !important; }
+    [data-baseweb="popover"] li { color: var(--ink) !important; }
+    [data-testid="stFileUploaderDropzone"] {
+      background: var(--surface) !important; border: 1px dashed #2b2b36 !important;
+    }
+    label, .stSelectbox label, .stRadio label { color: var(--ink-2) !important; }
     .stButton > button * , .stDownloadButton > button *,
     .stFormSubmitButton > button * { color: inherit !important; }
 

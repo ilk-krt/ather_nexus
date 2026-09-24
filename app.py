@@ -10,6 +10,14 @@ Kaynak: portfolio/classification.py, prices.py, storage.py, analytics.py, app.py
 from __future__ import annotations
 
 
+# --- Sürüm damgası -----------------------------------------------------------
+# Derleyici üretir. Amacı tek bir soruyu kesin cevaplamak: "yüklediğim dosya
+# gerçekten çalışıyor mu?" Uygulama bunu başlıkta ve Ayarlar'da gösterir;
+# yüklediğiniz dosyanınkiyle aynı değilse yayındaki sürüm eski demektir.
+BUILD_ID = "5b54e35f76"
+BUILD_TIME = "2026-09-24 16:28"
+
+
 # ==========================================================================
 # KAYNAK: portfolio/classification.py
 # ==========================================================================
@@ -3909,6 +3917,11 @@ GOSTER_ORAN = an.display_rate(GOSTER, snap.fx)
 if GOSTER_ORAN != GOSTER_ORAN:
     GOSTER_ORAN = 1.0
 
+# Tek dosya sürümünde derleyici BUILD_ID/BUILD_TIME enjekte eder; modüler
+# çalıştırmada yoktur. globals() ile okuyoruz ki iki kipte de çalışsın.
+SURUM = globals().get("BUILD_ID", "modüler")
+SURUM_ZAMAN = globals().get("BUILD_TIME", "")
+
 meta = [f"Son güncelleme <b>{snap.fetched_at}</b>"]
 meta.append(f"USD/TRY <b>{usdtry:,.2f}</b>" if usdtry else "USD/TRY <b>—</b>")
 if snap.fx.get("EURTRY"):
@@ -3916,6 +3929,7 @@ if snap.fx.get("EURTRY"):
 if snap.gold_usd_oz and usdtry:
     meta.append(f"Gram altın <b>₺{snap.gold_usd_oz / px.TROY_OUNCE_G * usdtry:,.0f}</b>")
 meta.append(f"Kayıt <b>{'GitHub' if store.backend == 'github' else 'yerel'}</b>")
+meta.append(f"Sürüm <b>{SURUM}</b>")
 st.markdown(f"<div class='nx-meta'>{'  ·  '.join(meta)}</div>", unsafe_allow_html=True)
 
 if store.backend == "local":
@@ -5090,6 +5104,15 @@ with tab_ice:
             st.error(f"Beklenmeyen hata: {exc}")
 
 with tab_ayar:
+    section("Sürüm")
+    st.code(f"Yapı kimliği : {SURUM}\n"
+            f"Derlenme     : {SURUM_ZAMAN or 'bilinmiyor'}", language="text")
+    st.caption(
+        "Yapı kimliği dosyanın İÇERİĞİNDEN üretilir. Yeni bir app.py "
+        "yükledikten sonra buradaki kimlik değişmediyse yayındaki sürüm hâlâ "
+        "eskidir — dosya yanlış depoya gitmiş, yanlış dalda kalmış ya da "
+        "uygulama yeniden başlatılmamış demektir.")
+
     section("Depolama")
     st.code(store.describe(), language="text")
     if store.backend == "local":

@@ -14,8 +14,8 @@ from __future__ import annotations
 # Derleyici üretir. Amacı tek bir soruyu kesin cevaplamak: "yüklediğim dosya
 # gerçekten çalışıyor mu?" Uygulama bunu başlıkta ve Ayarlar'da gösterir;
 # yüklediğiniz dosyanınkiyle aynı değilse yayındaki sürüm eski demektir.
-BUILD_ID = "adbcc5ccb2"
-BUILD_TIME = "2026-09-24 16:54"
+BUILD_ID = "f0df2285b9"
+BUILD_TIME = "2026-09-24 18:44"
 
 
 # ==========================================================================
@@ -516,7 +516,13 @@ TEFAS_REFERER = "https://www.tefas.gov.tr/TarihselVeriler.aspx"
 # baştan çalıştırıyor, bu da modül seviyesindeki sıradan bir değişkeni her
 # seferinde sıfırlardı ve "sus" hiç kalıcı olmazdı. Geçici dosya süreç/betik
 # çalıştırmaları arasında hayatta kalıyor.
-_TEFAS_SUS_SANIYE = 360.0
+#
+# 6 dakika olarak başladı ama gerçek kullanımda TEFAS'ın yasağı bundan çok
+# daha uzun sürebiliyor (muhtemelen tek bir istemciye değil, Streamlit Cloud
+# gibi paylaşımlı bulut IP aralıklarına toptan uygulanan bir engelleme).
+# 6 dakikada bir tekrar denemek, engel hâlâ sürüyorsa boşuna TEFAS'ı
+# yoklamaktan başka işe yaramıyor — 30 dakikaya çıkarıldı.
+_TEFAS_SUS_SANIYE = 1800.0
 _TEFAS_SUS_DOSYA = pathlib.Path(tempfile.gettempdir()) / "aether_tefas_sus.txt"
 
 
@@ -938,8 +944,10 @@ def fetch_tefas(codes: Iterable[str], *, lookback_days: int = 15,
         if errors is not None:
             errors.append(
                 "TEFAS çok sık istek nedeniyle sizi geçici olarak sınırladı "
-                "(429 Too Many Requests). Bir süre (birkaç dakika) hiç "
-                "TEFAS isteği atılmayacak, sonra otomatik tekrar denenecek.")
+                "(429 Too Many Requests). Yaklaşık 30 dakika hiç TEFAS "
+                "isteği atılmayacak, sonra otomatik tekrar denenecek. Bu "
+                "süre boyunca ilgili fonların değerini Varlıklar → Değer "
+                "Güncelle'den elle girebilirsiniz.")
 
     if errors is not None and sorunlar:
         errors.extend(sorunlar)

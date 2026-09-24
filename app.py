@@ -514,6 +514,16 @@ class MarketSnapshot:
     quotes: dict[str, Quote] = field(default_factory=dict)
     errors: list[str] = field(default_factory=list)
     fetched_at: str = ""
+    # sembol -> para birimi -> dönem -> yüzde değişim
+    # Isı haritası bunu kullanır. Değişim, varlığın SEÇİLEN para birimindeki
+    # değerine göre hesaplanır: TRY seçiliyse kur etkisi dahildir, USD
+    # seçiliyse ABD hissesi kendi doğal hareketini gösterir.
+    changes: dict[str, dict[str, dict[str, float]]] = field(default_factory=dict)
+    # sembol -> [(tarih, bir birimin TL değeri)] — karşılaştırma grafiği
+    # portföyün getiri serisini bundan üretir.
+    series: dict[str, list] = field(default_factory=dict)
+    # ölçüt adı -> [(tarih, TL değeri)]
+    benchmarks: dict[str, list] = field(default_factory=dict)
 
     @property
     def usdtry(self) -> float | None:
@@ -523,6 +533,31 @@ class MarketSnapshot:
 # ---------------------------------------------------------------------------
 # YAHOO FINANCE
 # ---------------------------------------------------------------------------
+def _close_series(df, ticker: str):
+    """yf.download çıktısından bir sembolün kapanış SERİSİNİ çıkarır."""
+    try:
+        if df is None or len(df) == 0:
+            return None
+        if hasattr(df.columns, "levels") and df.columns.nlevels > 1:
+            if "Close" in df.columns.get_level_values(0):
+                series = (df["Close"][ticker]
+                          if ticker in df["Close"].columns else None)
+            elif ticker in df.columns.get_level_values(0):
+                series = df[ticker]["Close"]
+            else:
+                series = None
+        else:
+            series = df["Close"] if "Close" in df.columns else None
+        if series is None:
+            return None
+        series = series.dropna()
+        series = series[series > 0]
+        return series if len(series) else None
+    except Exception as exc:                      # pragma: no cover
+        log.warning("Yahoo serisi okunamadı (%s): %s", ticker, exc)
+        return None
+
+
 def _last_close(df, ticker: str) -> float | None:
     """yf.download çıktısından son geçerli kapanışı çıkarır (tek/çoklu sembol)."""
     try:
@@ -551,14 +586,29 @@ def _last_close(df, ticker: str) -> float | None:
 
 def fetch_yahoo(tickers: Iterable[str], *, period: str = "5d",
                 retries: int = 2) -> dict[str, float]:
-    """Verilen sembollerin son kapanışlarını tek toplu çağrıyla getirir."""
+    """Son kapanışlar. Seriyi de isteyen build_snapshot fetch_yahoo_series kullanır."""
+    return {t: float(sr.iloc[-1])
+            for t, sr in fetch_yahoo_series(tickers, period=period,
+                                            retries=retries).items()
+            if len(sr)}
+
+
+def fetch_yahoo_series(tickers: Iterable[str], *, period: str = "5d",
+                       retries: int = 2) -> dict[str, "Any"]:
+    """
+    Sembollerin kapanış SERİLERİNİ tek toplu çağrıyla getirir.
+
+    Seri gerekiyor çünkü ısı haritası 1 gün / 1 hafta / 1 ay değişimini
+    hesaplıyor. Son fiyatı ayrıca indirmiyoruz: fetch_yahoo bu serinin son
+    elemanını alıyor, böylece tek indirme iki işi de görüyor.
+    """
     tickers = sorted({t for t in tickers if t})
     if not tickers:
         return {}
 
     import yfinance as yf  # yerel import: test ederken ağ gerekmesin
 
-    out: dict[str, float] = {}
+    out: dict[str, Any] = {}
     last_exc: Exception | None = None
     for attempt in range(retries + 1):
         try:
@@ -572,9 +622,9 @@ def fetch_yahoo(tickers: Iterable[str], *, period: str = "5d",
                 group_by="column",
             )
             for tk in tickers:
-                px = _last_close(df, tk)
-                if px is not None and px > 0:
-                    out[tk] = px
+                sr = _close_series(df, tk)
+                if sr is not None and len(sr):
+                    out[tk] = sr
             if out:
                 break
         except Exception as exc:
@@ -589,9 +639,10 @@ def fetch_yahoo(tickers: Iterable[str], *, period: str = "5d",
             try:
                 hist = yf.Ticker(tk).history(period=period)
                 if not hist.empty:
-                    val = float(hist["Close"].dropna().iloc[-1])
-                    if val > 0:
-                        out[tk] = val
+                    sr = hist["Close"].dropna()
+                    sr = sr[sr > 0]
+                    if len(sr):
+                        out[tk] = sr
             except Exception as exc:
                 log.warning("Yahoo tekil çağrı hatası (%s): %s", tk, exc)
 
@@ -715,7 +766,9 @@ def _tefas_rows(session, fontip: str, start, end, timeout: int) -> list[dict]:
 
 def fetch_tefas(codes: Iterable[str], *, lookback_days: int = 15,
                 timeout: int = 20,
-                errors: list[str] | None = None) -> dict[str, float]:
+                errors: list[str] | None = None,
+                series_out: dict[str, dict[str, float]] | None = None
+                ) -> dict[str, float]:
     """
     TEFAS fon fiyatlarını sitenin kendi API'sinden çeker.
 
@@ -747,6 +800,8 @@ def fetch_tefas(codes: Iterable[str], *, lookback_days: int = 15,
     aranan = set(codes)
     en_guncel: dict[str, tuple[float, float]] = {}
     sorunlar: list[str] = []
+    # kod -> {tarih_metni: fiyat} — ısı haritası dönem değişimi için kullanır
+    seriler: dict[str, dict[str, float]] = {}
 
     def isle(rows) -> None:
         for r in rows:
@@ -763,6 +818,7 @@ def fetch_tefas(codes: Iterable[str], *, lookback_days: int = 15,
                               .replace(".", "").replace("/", "")[:14] or 0)
             except ValueError:
                 tarih = 0.0
+            seriler.setdefault(kod, {})[f"{tarih:.0f}"] = fiyat
             onceki = en_guncel.get(kod)
             if onceki is None or tarih >= onceki[0]:
                 en_guncel[kod] = (tarih, fiyat)
@@ -802,6 +858,8 @@ def fetch_tefas(codes: Iterable[str], *, lookback_days: int = 15,
 
     if errors is not None and sorunlar:
         errors.extend(sorunlar)
+    if series_out is not None:
+        series_out.update(seriler)
 
     eksik = sorted(aranan - set(en_guncel))
     if eksik:
@@ -813,6 +871,274 @@ def fetch_tefas(codes: Iterable[str], *, lookback_days: int = 15,
 # ---------------------------------------------------------------------------
 # ANA GİRİŞ NOKTASI
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# DÖNEM DEĞİŞİMLERİ (ısı haritası)
+# ---------------------------------------------------------------------------
+# Etiket -> kaç TAKVİM günü geriye bakılacak. Borsa günü değil takvim günü
+# kullanıyoruz: "1 hafta" kullanıcı için 7 gün öncesidir, 5 seans öncesi değil.
+CHANGE_PERIODS = {"1g": 1, "1h": 7, "1a": 30, "3a": 90, "6a": 180, "1y": 365}
+CHANGE_CURRENCIES = ("TRY", "USD", "EUR")
+
+# Karşılaştırma aracının sunduğu ölçütler: etiket -> Yahoo sembolü.
+# Hepsi TL'ye çevrilir, böylece portföyle aynı zeminde karşılaştırılır.
+BENCHMARKS = {
+    "BIST 100": "XU100.IS",
+    "S&P 500": "^GSPC",
+    "Nasdaq 100": "^NDX",
+    "Altın (gram)": YAHOO_GOLD,
+    "Gümüş (gram)": YAHOO_SILVER,
+    "Dolar": "TRY=X",
+    "Euro": "EURTRY=X",
+    "Bitcoin": "BTC-USD",
+}
+
+
+def _to_points(obj) -> list[tuple[dt.date, float]]:
+    """pandas Serisi ya da {tarih: fiyat} sözlüğünü sıralı (tarih, değer) listesine çevirir."""
+    if obj is None:
+        return []
+    noktalar: list[tuple[dt.date, float]] = []
+
+    if isinstance(obj, dict):
+        for ham_tarih, deger in obj.items():
+            metin = str(ham_tarih).split(".")[0]
+            try:
+                if len(metin) >= 14:            # epoch ms
+                    tarih = dt.datetime.utcfromtimestamp(int(metin) / 1000).date()
+                elif len(metin) == 8:           # YYYYAAGG
+                    tarih = dt.date(int(metin[:4]), int(metin[4:6]), int(metin[6:8]))
+                elif len(metin) >= 10:          # epoch sn
+                    tarih = dt.datetime.utcfromtimestamp(int(metin)).date()
+                else:
+                    continue
+            except (ValueError, OverflowError, OSError):
+                continue
+            noktalar.append((tarih, float(deger)))
+    else:
+        try:
+            for damga, deger in obj.items():
+                try:
+                    tarih = damga.date() if hasattr(damga, "date") else damga
+                    noktalar.append((tarih, float(deger)))
+                except (TypeError, ValueError):
+                    continue
+        except AttributeError:
+            return []
+
+    noktalar = [(t, d) for t, d in noktalar if d == d and d > 0]
+    noktalar.sort(key=lambda x: x[0])
+    return noktalar
+
+
+def _at_or_before(noktalar: list[tuple[dt.date, float]],
+                  hedef: dt.date) -> float | None:
+    """Hedef tarihe eşit ya da ondan önceki EN YAKIN kaydı verir (tatiller için)."""
+    bulunan = None
+    for tarih, deger in noktalar:
+        if tarih <= hedef:
+            bulunan = deger
+        else:
+            break
+    return bulunan
+
+
+def _combine(a: list[tuple[dt.date, float]], b: list[tuple[dt.date, float]],
+             carp: bool = True) -> list[tuple[dt.date, float]]:
+    """
+    İki seriyi tarih bazında birleştirir (fiyat x kur gibi).
+
+    b'de o tarih yoksa ondan önceki en yakın değer kullanılır: borsa günleri
+    ile kur günleri her zaman örtüşmüyor ve kesişim alınsa seri çok kısalırdı.
+    """
+    if not a or not b:
+        return []
+    out: list[tuple[dt.date, float]] = []
+    b_sozluk = dict(b)
+    for tarih, deger in a:
+        eslesen = b_sozluk.get(tarih)
+        if eslesen is None:
+            eslesen = _at_or_before(b, tarih)
+        if eslesen is None or eslesen <= 0:
+            continue
+        out.append((tarih, deger * eslesen if carp else deger / eslesen))
+    return out
+
+
+def _pct_change(noktalar: list[tuple[dt.date, float]], gun: int) -> float | None:
+    """Son değerin, 'gun' takvim günü öncesine göre yüzde değişimi."""
+    if len(noktalar) < 2:
+        return None
+    son_tarih, son_deger = noktalar[-1]
+    onceki = _at_or_before(noktalar, son_tarih - dt.timedelta(days=gun))
+    if onceki is None or onceki <= 0:
+        return None
+    return (son_deger / onceki - 1.0) * 100.0
+
+
+def compute_changes(assets: list[dict[str, Any]], snap: "MarketSnapshot",
+                    yahoo_series: dict[str, Any],
+                    tefas_series: dict[str, dict[str, float]]) -> None:
+    """
+    Her varlık için 1 gün / 1 hafta / 1 ay yüzde değişimini, TRY / USD / EUR
+    cinsinden ayrı ayrı hesaplayıp snap.changes'e yazar.
+
+    NEDEN üç para birimi: Türk yatırımcı için NVDA'nın TL getirisi kur etkisini
+    içerir; dolar bazlı bakınca hissenin kendi hareketi görünür. Isı haritası
+    hangi para birimi seçiliyse onu gösterir, böylece renk ile etiket aynı şeyi
+    anlatır.
+    """
+    kur_noktalari = {
+        ad: _to_points(yahoo_series.get(tk))
+        for ad, tk in YAHOO_FX.items()
+    }
+    usdtry = kur_noktalari.get("USDTRY") or []
+    eurtry = kur_noktalari.get("EURTRY") or []
+    hkdtry = kur_noktalari.get("HKDTRY") or []
+    altin = _to_points(yahoo_series.get(YAHOO_GOLD))
+    gumus = _to_points(yahoo_series.get(YAHOO_SILVER))
+
+    def try_serisi(a: dict[str, Any]) -> list[tuple[dt.date, float]]:
+        """Varlığın BİR BİRİMİNİN TL değerinin zaman serisi."""
+        kaynak, sembol = a.get("source"), a.get("symbol", "")
+        birim_g = METAL_UNITS.get((a.get("unit") or "GRAM").upper(), 1.0)
+        para = (a.get("currency") or "TRY").upper()
+
+        if kaynak == SRC_GOLD or kaynak == SRC_SILVER:
+            ons = altin if kaynak == SRC_GOLD else gumus
+            usd = [(t, v / TROY_OUNCE_G * birim_g) for t, v in ons]
+            return usd if para == "USD" else _combine(usd, usdtry)
+        if kaynak == SRC_TEFAS:
+            return _to_points(tefas_series.get(sembol.upper()))
+        if kaynak == SRC_CASH:
+            birim = [(t, 1.0) for t, _ in (usdtry or eurtry or [])]
+            if para == "TRY":
+                return birim
+            return _combine(birim, usdtry if para == "USD" else eurtry)
+        if kaynak == SRC_YAHOO:
+            ham = _to_points(yahoo_series.get(sembol))
+            if not ham:
+                return []
+            if para == "TRY":
+                return ham
+            if para == "USD":
+                return _combine(ham, usdtry)
+            if para == "EUR":
+                return _combine(ham, eurtry)
+            if para == "HKD":
+                return _combine(ham, hkdtry)
+        return []
+
+    for a in assets:
+        sembol = a.get("symbol", "")
+        if not sembol or sembol in snap.changes:
+            continue
+        temel = try_serisi(a)
+        if len(temel) < 2:
+            continue
+        snap.series[sembol] = temel
+        kayit: dict[str, dict[str, float]] = {}
+        for para in CHANGE_CURRENCIES:
+            if para == "TRY":
+                seri = temel
+            elif para == "USD":
+                seri = _combine(temel, usdtry, carp=False)
+            else:
+                seri = _combine(temel, eurtry, carp=False)
+            donemler = {}
+            for etiket, gun in CHANGE_PERIODS.items():
+                yuzde = _pct_change(seri, gun)
+                if yuzde is not None:
+                    donemler[etiket] = yuzde
+            if donemler:
+                kayit[para] = donemler
+        if kayit:
+            snap.changes[sembol] = kayit
+
+    # Ölçütler: hepsi TL cinsine çevrilir ki portföyle aynı zeminde dursun.
+    for ad, tk in BENCHMARKS.items():
+        ham = _to_points(yahoo_series.get(tk))
+        if len(ham) < 2:
+            continue
+        if tk in (YAHOO_GOLD, YAHOO_SILVER):
+            gram = [(t, v / TROY_OUNCE_G) for t, v in ham]
+            snap.benchmarks[ad] = _combine(gram, usdtry)
+        elif tk in ("^GSPC", "^NDX", "BTC-USD"):
+            snap.benchmarks[ad] = _combine(ham, usdtry)
+        else:
+            snap.benchmarks[ad] = ham
+
+
+# ---------------------------------------------------------------------------
+# TEMEL VERİ (analist beklentileri)
+# ---------------------------------------------------------------------------
+# Buradaki her şey ÜÇÜNCÜ TARAF görüşüdür: analistlerin ortalama hedef fiyatı,
+# beklenen kâr büyümesi, çarpanlar. Ne bizim tahminimiz ne de bir tavsiyedir;
+# arayüzde de böyle etiketlenir. Analist hedefleri sistematik olarak iyimser
+# olmakla bilinir, o yüzden "potansiyel" sütunu bir vaat değil bir beklentidir.
+FUNDAMENTAL_ALANLAR = ("hedef", "potansiyel", "kar_buyume", "gelir_buyume",
+                       "ileri_fk", "fk", "pd_dd", "analist_sayisi", "tavsiye",
+                       "sektor", "ad", "piyasa_degeri")
+
+
+def fetch_fundamentals(tickers: Iterable[str], *,
+                       errors: list[str] | None = None) -> dict[str, dict]:
+    """
+    Sembol başına analist beklentilerini çeker (yfinance .info).
+
+    Toplu uç noktası olmadığı için sembol başına bir istek gider; bu yüzden
+    arayüzde OTOMATİK değil, düğmeyle ve uzun önbellekle çağrılır. Bir
+    sembolün düşmesi diğerlerini etkilemez.
+    """
+    out: dict[str, dict] = {}
+    sorunlar: list[str] = []
+    try:
+        import yfinance as yf
+    except Exception as exc:                        # pragma: no cover
+        if errors is not None:
+            errors.append(f"yfinance yüklenemedi: {exc}")
+        return out
+
+    for tk in sorted({t for t in tickers if t}):
+        try:
+            bilgi = yf.Ticker(tk).info or {}
+        except Exception as exc:
+            sorunlar.append(f"{tk}: {type(exc).__name__}")
+            continue
+        if not bilgi:
+            continue
+
+        fiyat = (bilgi.get("currentPrice") or bilgi.get("regularMarketPrice")
+                 or bilgi.get("previousClose"))
+        hedef = bilgi.get("targetMeanPrice")
+        potansiyel = ((hedef / fiyat - 1.0) * 100.0
+                      if hedef and fiyat and fiyat > 0 else None)
+
+        def _yuzde(anahtar):
+            v = bilgi.get(anahtar)
+            return v * 100.0 if isinstance(v, (int, float)) else None
+
+        out[tk] = {
+            "ad": bilgi.get("shortName") or bilgi.get("longName") or tk,
+            "sektor": bilgi.get("sector") or "",
+            "endustri": bilgi.get("industry") or "",
+            "fiyat": fiyat,
+            "hedef": hedef,
+            "potansiyel": potansiyel,
+            "kar_buyume": _yuzde("earningsGrowth"),
+            "gelir_buyume": _yuzde("revenueGrowth"),
+            "fk": bilgi.get("trailingPE"),
+            "ileri_fk": bilgi.get("forwardPE"),
+            "pd_dd": bilgi.get("priceToBook"),
+            "analist_sayisi": bilgi.get("numberOfAnalystOpinions"),
+            "tavsiye": bilgi.get("recommendationKey") or "",
+            "piyasa_degeri": bilgi.get("marketCap"),
+        }
+
+    if errors is not None and sorunlar:
+        errors.extend(sorunlar)
+    return out
+
+
 def _metal_unit_price(usd_per_oz: float, unit: str | None, currency: str,
                       usdtry: float | None) -> float | None:
     grams = METAL_UNITS.get((unit or "GRAM").upper(), 1.0)
@@ -840,8 +1166,12 @@ def build_snapshot(assets: list[dict[str, Any]]) -> MarketSnapshot:
     if needs_silver:
         infra.add(YAHOO_SILVER)
 
+    # 3 aylık geçmiş: hem son fiyat hem 1 gün / 1 hafta / 1 ay değişimi için.
+    yahoo_series: dict[str, Any] = {}
     try:
-        prices = fetch_yahoo(yahoo_tickers | infra)
+        yahoo_series = fetch_yahoo_series(
+            yahoo_tickers | infra | set(BENCHMARKS.values()), period="2y")
+        prices = {t: float(sr.iloc[-1]) for t, sr in yahoo_series.items() if len(sr)}
     except Exception as exc:
         prices = {}
         snap.errors.append(f"Yahoo Finance'e ulaşılamadı: {exc}")
@@ -863,9 +1193,13 @@ def build_snapshot(assets: list[dict[str, Any]]) -> MarketSnapshot:
 
     tefas_prices: dict[str, float] = {}
     tefas_errors: list[str] = []
+    tefas_series: dict[str, dict[str, float]] = {}
     if tefas_codes:
         try:
-            tefas_prices = fetch_tefas(tefas_codes, errors=tefas_errors)
+            # 45 gün: 1 aylık değişim için yeterli geçmiş kalsın.
+            tefas_prices = fetch_tefas(tefas_codes, lookback_days=45,
+                                       errors=tefas_errors,
+                                       series_out=tefas_series)
         except Exception as exc:
             snap.errors.append(f"TEFAS'a ulaşılamadı: {exc}")
         # Sadece değeri fiyata BAĞLI olan satırlar için uyar; kova satırlarının
@@ -931,6 +1265,13 @@ def build_snapshot(assets: list[dict[str, Any]]) -> MarketSnapshot:
             q.error = f"Bilinmeyen fiyat kaynağı: {src}"
 
         snap.quotes[sym] = q
+
+    # Isı haritası verisi. Fiyatlar gelmiş olsa bile geçmiş seri gelmemiş
+    # olabilir; bu bir HATA değil, sadece o varlık renklendirilemez.
+    try:
+        compute_changes(assets, snap, yahoo_series, tefas_series)
+    except Exception as exc:                       # noqa: BLE001
+        log.warning("Dönem değişimleri hesaplanamadı: %s", exc)
 
     return snap
 
@@ -1244,10 +1585,25 @@ def to_try_rate(currency: str, fx: dict[str, float]) -> float:
     return float("nan")
 
 
+CHANGE_LABELS = {"1g": "1G %", "1h": "1H %", "1a": "1A %",
+                 "3a": "3A %", "6a": "6A %", "1y": "1Y %"}
+PERIOD_GUN = {"1G %": 1, "1H %": 7, "1A %": 30, "3A %": 90,
+              "6A %": 180, "1Y %": 365}
+
+
 def build_dataframe(assets: list[dict[str, Any]], quotes: dict[str, Any],
-                    fx: dict[str, float] | None = None) -> pd.DataFrame:
-    """Varlık listesi + fiyatlardan hesaplanmış tabloyu üretir."""
+                    fx: dict[str, float] | None = None,
+                    changes: dict[str, dict[str, dict[str, float]]] | None = None,
+                    change_currency: str = "TRY") -> pd.DataFrame:
+    """
+    Varlık listesi + fiyatlardan hesaplanmış tabloyu üretir.
+
+    `changes` verilirse 1 Gün / 1 Hafta / 1 Ay yüzde sütunları eklenir. Bunlar
+    ISI HARİTASININ girdisidir ve `change_currency` cinsinden hesaplanmıştır:
+    TRY'de kur etkisi dahildir, USD'de ABD hissesinin kendi hareketi görünür.
+    """
     fx = fx or {}
+    changes = changes or {}
     rows: list[dict[str, Any]] = []
     for a in assets:
         sym = a["symbol"]
@@ -1295,6 +1651,9 @@ def build_dataframe(assets: list[dict[str, Any]], quotes: dict[str, Any],
             "Değerleme": "Diğer" if kova else "Canlı",
             "Adet": qty,
             "Maliyet": cost,
+            # Varlığın KENDİ para birimindeki değeri — etiketlerde bunu
+            # gösteriyoruz ki ABD hissesi dolar, BIST hissesi lira okunsun.
+            "Değer (kendi)": deger_nat,
             "Fiyat": price_val,
             "Maliyet (TRY)": maliyet_nat * cost_rate,
             "Değer (TRY)": deger_nat * rate,
@@ -1304,6 +1663,9 @@ def build_dataframe(assets: list[dict[str, Any]], quotes: dict[str, Any],
                      if maliyet_nat * cost_rate > 0 else float("nan"),
             "Fiyat OK": ok,
             "Hata": "" if ok else err,
+            **{etiket: (changes.get(sym, {}).get(change_currency, {}).get(anahtar)
+                        if not kova else None)
+               for anahtar, etiket in CHANGE_LABELS.items()},
         })
 
     df = pd.DataFrame(rows)
@@ -1446,6 +1808,114 @@ def convert_columns(df: pd.DataFrame, currency: str,
     return out.rename(columns=yeniden_ad)
 
 
+# ---------------------------------------------------------------------------
+# KARŞILAŞTIRMA SERİSİ
+# ---------------------------------------------------------------------------
+def _endeksle(noktalar: list[tuple], baslangic) -> list[tuple]:
+    """Seriyi başlangıç tarihinde 100'e sabitler; farklı ölçekler kıyaslanabilsin."""
+    taban = None
+    for tarih, deger in noktalar:
+        if tarih >= baslangic and deger > 0:
+            taban = deger
+            break
+    if not taban:
+        return []
+    return [(t, v / taban * 100.0) for t, v in noktalar if t >= baslangic]
+
+
+def portfoy_getiri_serisi(df: pd.DataFrame, series: dict[str, list],
+                          gun: int) -> list[tuple]:
+    """
+    Portföyün getiri serisi: BUGÜNKÜ ağırlıklarla geriye dönük hesaplanır.
+
+    DİKKAT — bu bir "şu anki portföyü o gün de elimde tutsaydım" senaryosudur.
+    Geçmişteki alım satımları bilmediği için gerçekleşmiş performansınız değil;
+    ama portföy değeri serisinden farklı olarak para giriş/çıkışlarından
+    ETKİLENMEZ, bu yüzden bir endeksle yan yana konabilecek tek seri budur.
+    """
+    if df is None or df.empty or not series:
+        return []
+    import datetime as _dt
+    baslangic = _dt.date.today() - _dt.timedelta(days=gun)
+
+    agirlikli: dict = {}
+    toplam_agirlik = 0.0
+    for _, satir in df.iterrows():
+        sembol = satir.get("Yahoo Sembol")
+        deger = satir.get("Değer (TRY)")
+        noktalar = series.get(sembol)
+        if not noktalar or deger is None or deger != deger or deger <= 0:
+            continue
+        endeks = _endeksle(noktalar, baslangic)
+        if len(endeks) < 2:
+            continue
+        toplam_agirlik += float(deger)
+        for tarih, puan in endeks:
+            onceki = agirlikli.get(tarih, (0.0, 0.0))
+            agirlikli[tarih] = (onceki[0] + puan * float(deger),
+                                onceki[1] + float(deger))
+
+    if not agirlikli or toplam_agirlik <= 0:
+        return []
+    # Her gün için O GÜN verisi olan pozisyonların ağırlıklı ortalaması
+    return sorted((t, pay / agr) for t, (pay, agr) in agirlikli.items() if agr > 0)
+
+
+def karsilastirma_tablosu(portfoy: list[tuple], olcutler: dict[str, list],
+                          gun: int) -> pd.DataFrame:
+    """Portföy ve seçilen ölçütlerin 100'e endekslenmiş serileri."""
+    import datetime as _dt
+    baslangic = _dt.date.today() - _dt.timedelta(days=gun)
+    seriler: dict[str, dict] = {}
+    if portfoy:
+        seriler["Portföyüm"] = dict(portfoy)
+    for ad, noktalar in olcutler.items():
+        endeks = _endeksle(noktalar, baslangic)
+        if len(endeks) >= 2:
+            seriler[ad] = dict(endeks)
+    if not seriler:
+        return pd.DataFrame()
+    df = pd.DataFrame(seriler).sort_index()
+    return df.ffill().dropna(how="all")
+
+
+# ---------------------------------------------------------------------------
+# HEDEF AĞIRLIK / DENGE
+# ---------------------------------------------------------------------------
+def denge_tablosu(df: pd.DataFrame, seviye: str,
+                  hedefler: dict[str, float]) -> pd.DataFrame:
+    """
+    Mevcut ağırlık ile KULLANICININ belirlediği hedef ağırlığı karşılaştırır.
+
+    Hedefleri biz üretmiyoruz — kullanıcı giriyor, biz aradaki farkı TL
+    cinsine çeviriyoruz. "Şu sınıfı %25'e indirmek istersem ne kadar kaydırmam
+    gerekir" sorusunun cevabı aritmetiktir; ne yapması gerektiği değildir.
+    """
+    bos = pd.DataFrame(columns=[seviye, "Mevcut %", "Hedef %", "Fark puan",
+                                "Fark (TRY)"])
+    if df is None or df.empty or seviye not in df.columns:
+        return bos
+    varlik = df[df["Ana Sınıf"] != "Yükümlülük"] if "Ana Sınıf" in df.columns else df
+    grup = varlik.groupby(seviye)["Değer (TRY)"].sum(min_count=1).dropna()
+    toplam = float(grup.sum())
+    if toplam <= 0:
+        return bos
+
+    satirlar = []
+    for ad, deger in grup.items():
+        mevcut = float(deger) / toplam * 100.0
+        hedef = float(hedefler.get(str(ad), mevcut))
+        satirlar.append({
+            seviye: ad,
+            "Mevcut %": mevcut,
+            "Hedef %": hedef,
+            "Fark puan": hedef - mevcut,
+            "Fark (TRY)": (hedef - mevcut) / 100.0 * toplam,
+        })
+    out = pd.DataFrame(satirlar).sort_values("Mevcut %", ascending=False)
+    return out.reset_index(drop=True)
+
+
 def allocation(df: pd.DataFrame, level: str) -> pd.DataFrame:
     """Bir hiyerarşi seviyesine göre dağılım tablosu."""
     if df.empty or level not in df.columns:
@@ -1546,13 +2016,135 @@ def sankey_data(df: pd.DataFrame, levels: list[str]) -> dict[str, Any]:
     }
 
 
-def treemap_data(df: pd.DataFrame, levels: list[str]) -> dict[str, Any]:
+# ---------------------------------------------------------------------------
+# ISI HARİTASI PALETİ
+# ---------------------------------------------------------------------------
+# Iraksak (diverging) rampa: iki kutup + NÖTR GRİ orta nokta. Orta noktada hue
+# yok — gökkuşağı rampası okunamaz olurdu.
+#
+# Neden saf kırmızı/yeşil değil: renk körlüğünde ayırt edilemez. Somon (#f07a72)
+# ile deniz yeşili (#45d69a) hem tonda hem AÇIKLIKTA ayrışır. Açıklık orta
+# noktadan iki uca doğru tekdüze artar (0.05 -> 0.34 ve 0.05 -> 0.52), yani
+# renk görülmese bile yoğunluk okunur. Ayrıca her kutuda yüzde YAZILI olduğu
+# için kimlik hiçbir zaman yalnız renge bağlı değildir.
+HEAT_STEPS: list[tuple[float, str]] = [
+    (-8.0, "#f07a72"),   # güçlü düşüş
+    (-4.0, "#d15a55"),
+    (-1.5, "#a24448"),
+    (-0.3, "#6e3a3f"),
+    (0.0,  "#3f3f4a"),   # nötr — hue yok
+    (0.3,  "#2a6b52"),
+    (1.5,  "#219166"),
+    (4.0,  "#27b87e"),
+    (8.0,  "#45d69a"),   # güçlü yükseliş
+]
+HEAT_NEUTRAL = "#3f3f4a"
+HEAT_UNKNOWN = "#26262e"     # değişim hesaplanamadı
+
+
+def heat_color(pct: float | None) -> str:
+    """Yüzde değişimi ıraksak rampadaki en yakın adıma oturtur."""
+    if pct is None or pct != pct:
+        return HEAT_UNKNOWN
+    if pct <= HEAT_STEPS[0][0]:
+        return HEAT_STEPS[0][1]
+    if pct >= HEAT_STEPS[-1][0]:
+        return HEAT_STEPS[-1][1]
+    for (alt, renk), (ust, _) in zip(HEAT_STEPS, HEAT_STEPS[1:]):
+        if alt <= pct < ust:
+            return renk
+    return HEAT_NEUTRAL
+
+
+def _relative_luminance(hex_color: str) -> float:
+    h = hex_color.lstrip("#")
+    kanal = []
+    for i in (0, 2, 4):
+        c = int(h[i:i + 2], 16) / 255
+        kanal.append(c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4)
+    return 0.2126 * kanal[0] + 0.7152 * kanal[1] + 0.0722 * kanal[2]
+
+
+def text_on(hex_color: str) -> str:
+    """
+    Zemine göre okunur yazı rengi. Rampanın her adımı için seçilen renk
+    4.5:1 kontrastı geçiyor (doğrulandı); açık uçlarda koyu, koyu uçlarda
+    beyaz yazı çıkar.
+    """
+    return "#0a0a0c" if _relative_luminance(hex_color) > 0.18 else "#ffffff"
+
+
+def _node_changes(valid: pd.DataFrame, levels: list[str],
+                  change_col: str) -> dict[tuple, float]:
+    """
+    Her hiyerarşi düğümü için DEĞERE GÖRE AĞIRLIKLI ortalama yüzde değişim.
+
+    Basit ortalama yanlış olurdu: 1.000 TL'lik pozisyonun %10'u ile 500.000
+    TL'lik pozisyonun %1'i aynı ağırlıkta sayılırdı. Grup rengi, grubun
+    gerçekte ne kadar hareket ettiğini göstermeli.
+    """
+    paylar: dict[tuple, float] = {}
+    agirliklar: dict[tuple, float] = {}
+    # _row_paths ile AYNI yol üretimini kullanmak şart: farklı üretirsek
+    # ağırlıklı ortalama, treemap'in gerçekte çizdiği düğümlere denk gelmez.
+    yollar = _row_paths(valid, levels)          # [(yol, değer), ...]
+    for (yol, agirlik), (_, satir) in zip(yollar, valid.iterrows()):
+        pct = satir.get(change_col)
+        if pct is None or pct != pct or agirlik <= 0:
+            continue
+        for derinlik in range(1, len(yol) + 1):
+            anahtar = yol[:derinlik]
+            paylar[anahtar] = paylar.get(anahtar, 0.0) + pct * agirlik
+            agirliklar[anahtar] = agirliklar.get(anahtar, 0.0) + agirlik
+    return {k: paylar[k] / agirliklar[k] for k in paylar if agirliklar.get(k)}
+
+
+def _node_native(valid: pd.DataFrame, levels: list[str]) -> dict[tuple, str]:
+    """
+    Her düğüm için KENDİ para birimindeki toplam — ama yalnızca düğümün
+    altındaki bütün satırlar aynı para birimindeyse.
+
+    Karışık bir düğümde (ör. "Hisse Senedi" altında hem BIST hem ABD)
+    dolarla lirayı toplamak anlamsız olurdu; orada boş dönüp arayüzün
+    seçili para birimini göstermesine bırakıyoruz.
+    """
+    toplam: dict[tuple, float] = {}
+    paralar: dict[tuple, set] = {}
+    yollar = _row_paths(valid, levels)
+    for (yol, _), (_, satir) in zip(yollar, valid.iterrows()):
+        deger = satir.get("Değer (kendi)")
+        para = str(satir.get("Para Birimi") or "TRY")
+        if deger is None or deger != deger:
+            continue
+        for derinlik in range(1, len(yol) + 1):
+            anahtar = yol[:derinlik]
+            toplam[anahtar] = toplam.get(anahtar, 0.0) + float(deger)
+            paralar.setdefault(anahtar, set()).add(para)
+
+    out: dict[tuple, str] = {}
+    for anahtar, tutar in toplam.items():
+        birimler = paralar.get(anahtar, set())
+        if len(birimler) != 1:
+            continue
+        para = next(iter(birimler))
+        isaret = CURRENCY_SYMBOLS.get(para, para + " ")
+        out[anahtar] = f"{isaret}{tutar:,.0f}"
+    return out
+
+
+def treemap_data(df: pd.DataFrame, levels: list[str],
+                 change_col: str | None = None) -> dict[str, Any]:
     """
     Treemap için ids/labels/parents/values. Sankey ile aynı hiyerarşiyi kullanır
     ama büyüklüğü alan olarak gösterdiği için 30+ pozisyonda çok daha okunaklıdır.
+
+    `change_col` verilirse kutular ANA SINIF rengiyle değil, o sütundaki yüzde
+    değişimle (ısı haritası) boyanır. Alan yine değeri gösterir; renk hareketi
+    gösterir — iki farklı bilgi, iki farklı kanal.
     """
     empty = {"ids": [], "labels": [], "parents": [], "values": [],
-             "colors": [], "paths": []}
+             "colors": [], "paths": [], "changes": [], "text_colors": [],
+             "natives": []}
     if df.empty or "Değer (TRY)" not in df.columns or not levels:
         return empty
     valid = df[df["Değer (TRY)"].notna() & (df["Değer (TRY)"] > 0)]
@@ -1563,24 +2155,43 @@ def treemap_data(df: pd.DataFrame, levels: list[str]) -> dict[str, Any]:
     top_colors = color_map(list(allocation(valid, levels[0])[levels[0]].astype(str)))
     max_depth = max((len(k) for k in totals), default=1)
 
+    isi = (_node_changes(valid, levels, change_col)
+           if change_col and change_col in valid.columns else {})
+    dogal = _node_native(valid, levels)
+
     ids: list[str] = []
     labels: list[str] = []
     parents: list[str] = []
     values: list[float] = []
     colors: list[str] = []
+    changes: list[float | None] = []
+    text_colors: list[str] = []
+    natives: list[str] = []
 
     for key in _sorted_keys(totals):
         ids.append(" › ".join(key))
         labels.append(key[-1])
         parents.append(" › ".join(key[:-1]) if len(key) > 1 else "")
         values.append(totals[key])
-        # Derinleştikçe saydamlaşan dolgu: iç içe kutular birbirinden ayrışır
-        alpha = 0.88 - 0.16 * min(len(key) - 1, max(max_depth - 1, 1))
-        colors.append(_rgba(top_colors.get(group[key], OTHER_COLOR),
-                            max(alpha, 0.34)))
+        natives.append(dogal.get(key, ""))
+        if change_col:
+            pct = isi.get(key)
+            renk = heat_color(pct)
+            colors.append(renk)
+            changes.append(pct)
+            text_colors.append(text_on(renk))
+        else:
+            # Derinleştikçe saydamlaşan dolgu: iç içe kutular birbirinden ayrışır
+            alpha = 0.88 - 0.16 * min(len(key) - 1, max(max_depth - 1, 1))
+            colors.append(_rgba(top_colors.get(group[key], OTHER_COLOR),
+                                max(alpha, 0.34)))
+            changes.append(None)
+            text_colors.append("#ececf1")
 
     return {"ids": ids, "labels": labels, "parents": parents,
-            "values": values, "colors": colors, "paths": ids}
+            "values": values, "colors": colors, "paths": ids,
+            "changes": changes, "text_colors": text_colors,
+            "natives": natives}
 
 
 def _rgba(hex_color: str, alpha: float) -> str:
@@ -2417,6 +3028,421 @@ def ornek_csv() -> str:
     )
 
 # ==========================================================================
+# KAYNAK: portfolio/insights.py
+# ==========================================================================
+
+
+import math
+from dataclasses import dataclass, field
+from typing import Any
+
+import pandas as pd
+
+# --------------------------------------------------------------------------
+# SEVİYELER
+# --------------------------------------------------------------------------
+KRITIK = "kritik"      # sayılar yanlış olabilir ya da tek kalemde aşırı risk
+DIKKAT = "dikkat"      # bakılmaya değer
+BILGI = "bilgi"        # nötr tespit
+IYI = "iyi"            # olumlu tespit
+
+SEVIYE_SIRA = {KRITIK: 0, DIKKAT: 1, BILGI: 2, IYI: 3}
+SEVIYE_ETIKET = {KRITIK: "🔴 Kritik", DIKKAT: "🟠 Dikkat",
+                 BILGI: "⚪ Bilgi", IYI: "🟢 İyi"}
+
+EŞIKLER: dict[str, float] = {
+    "tek_pozisyon_uyari": 15.0,     # tek pozisyon portföyün %'si
+    "tek_pozisyon_kritik": 25.0,
+    "tek_sinif_uyari": 45.0,        # tek ana sınıfın %'si
+    "ilk5_uyari": 60.0,             # en büyük 5 pozisyonun toplam %'si
+    "kucuk_pozisyon": 0.35,         # bu %'nin altı "kuyruk"
+    "kuyruk_sayisi": 8,             # kaç kuyruk pozisyondan sonra uyarılır
+    "nakit_yuksek": 20.0,
+    "nakit_dusuk": 2.0,
+    "borc_orani_uyari": 20.0,       # borç / varlık
+    "buyuk_zarar": -35.0,           # tek pozisyonda K/Z %
+    "buyuk_kar": 100.0,
+}
+
+
+@dataclass
+class Finding:
+    seviye: str
+    baslik: str
+    detay: str
+    metrik: str = ""
+    etiketler: list[str] = field(default_factory=list)
+
+
+# --------------------------------------------------------------------------
+# YARDIMCILAR
+# --------------------------------------------------------------------------
+def _yuzde(deger: float, toplam: float) -> float:
+    return (deger / toplam * 100.0) if toplam else float("nan")
+
+
+def _fmt(sayi: float, basamak: int = 1) -> str:
+    if sayi is None or sayi != sayi:
+        return "—"
+    return f"{sayi:,.{basamak}f}"
+
+
+def hhi(agirliklar: list[float]) -> float:
+    """
+    Herfindahl-Hirschman yoğunlaşma endeksi (0-10.000).
+
+    Ağırlıkların yüzde cinsinden KARELERİ toplamıdır. Eşit ağırlıklı N
+    pozisyonda 10.000/N çıkar; yani 1/HHI*10.000 "etkin pozisyon sayısı"nı
+    verir — 40 satırlık bir portföy aslında 6 pozisyon gibi davranıyorsa
+    bunu ortalama ağırlığa bakarak göremezsiniz, HHI gösterir.
+    """
+    return sum(w * w for w in agirliklar if w == w)
+
+
+def etkin_pozisyon_sayisi(agirliklar: list[float]) -> float:
+    h = hhi(agirliklar)
+    return (10_000.0 / h) if h > 0 else float("nan")
+
+
+# --------------------------------------------------------------------------
+# KURALLAR
+# --------------------------------------------------------------------------
+def _kural_yogunlasma(df: pd.DataFrame, toplam: float,
+                      esik: dict[str, float]) -> list[Finding]:
+    out: list[Finding] = []
+    canli = df[df["Değer (TRY)"].notna() & (df["Değer (TRY)"] > 0)]
+    if canli.empty:
+        return out
+
+    sirali = canli.sort_values("Değer (TRY)", ascending=False)
+    agirliklar = [_yuzde(v, toplam) for v in sirali["Değer (TRY)"]]
+
+    en_buyuk = sirali.iloc[0]
+    w1 = agirliklar[0]
+    if w1 >= esik["tek_pozisyon_kritik"]:
+        out.append(Finding(
+            KRITIK, f"{en_buyuk['Etiket']} tek başına portföyün %{_fmt(w1)}'i",
+            "Tek bir pozisyonun bu ağırlıkta olması, portföyün getirisini büyük "
+            "ölçüde o varlığın hareketine bağlar. Diğer bütün pozisyonların "
+            "toplamı bu tek kalemin etkisini dengelemekte zorlanır.",
+            f"%{_fmt(w1)}", ["yoğunlaşma"]))
+    elif w1 >= esik["tek_pozisyon_uyari"]:
+        out.append(Finding(
+            DIKKAT, f"En büyük pozisyon: {en_buyuk['Etiket']} (%{_fmt(w1)})",
+            "Portföyün altıda birinden fazlası tek bir varlıkta.",
+            f"%{_fmt(w1)}", ["yoğunlaşma"]))
+
+    ilk5 = sum(agirliklar[:5])
+    if ilk5 >= esik["ilk5_uyari"]:
+        adlar = ", ".join(str(x) for x in sirali["Etiket"].head(5))
+        out.append(Finding(
+            DIKKAT, f"En büyük 5 pozisyon portföyün %{_fmt(ilk5)}'i",
+            f"{adlar}. Kalan {len(sirali) - 5} pozisyon toplamda "
+            f"%{_fmt(100 - ilk5)} yer tutuyor.",
+            f"%{_fmt(ilk5)}", ["yoğunlaşma"]))
+
+    etkin = etkin_pozisyon_sayisi(agirliklar)
+    out.append(Finding(
+        BILGI, f"Etkin pozisyon sayısı: {_fmt(etkin)}",
+        f"Portföyde {len(sirali)} satır var ama ağırlıklar eşit olmadığı için "
+        f"çeşitlenme, eşit ağırlıklı {_fmt(etkin)} pozisyonluk bir portföye "
+        f"denk düşüyor. (Herfindahl endeksi {_fmt(hhi(agirliklar), 0)}.)",
+        f"{_fmt(etkin)} / {len(sirali)}", ["yoğunlaşma"]))
+
+    # Kuyruk pozisyonlar
+    kuyruk = [(e, w) for e, w in zip(sirali["Etiket"], agirliklar)
+              if w < esik["kucuk_pozisyon"]]
+    if len(kuyruk) >= esik["kuyruk_sayisi"]:
+        pay = sum(w for _, w in kuyruk)
+        out.append(Finding(
+            BILGI, f"{len(kuyruk)} pozisyon portföyün yalnızca %{_fmt(pay)}'ini "
+                   f"oluşturuyor",
+            "Bu kadar küçük pozisyonlar portföyün getirisini pratikte "
+            "etkilemez ama takip, komisyon ve vergi tarafında yük yaratır: "
+            + ", ".join(str(e) for e, _ in kuyruk[:10])
+            + (" …" if len(kuyruk) > 10 else ""),
+            f"{len(kuyruk)} satır · %{_fmt(pay)}", ["kuyruk"]))
+    return out
+
+
+def _kural_sinif_dagilimi(df: pd.DataFrame, toplam: float,
+                          esik: dict[str, float]) -> list[Finding]:
+    out: list[Finding] = []
+    if "Ana Sınıf" not in df.columns:
+        return out
+    grup = (df.groupby("Ana Sınıf")["Değer (TRY)"].sum(min_count=1)
+              .dropna().sort_values(ascending=False))
+    if grup.empty:
+        return out
+
+    for sinif, deger in grup.items():
+        pay = _yuzde(deger, toplam)
+        if sinif == "Nakit":
+            if pay >= esik["nakit_yuksek"]:
+                out.append(Finding(
+                    DIKKAT, f"Nakit portföyün %{_fmt(pay)}'i",
+                    "Nakit, enflasyonun altında getiri sağlarsa reel olarak "
+                    "değer kaybeder. Bu oranın bilinçli bir tercih mi yoksa "
+                    "birikmiş bakiye mi olduğu bakılmaya değer.",
+                    f"%{_fmt(pay)}", ["dağılım"]))
+            elif pay <= esik["nakit_dusuk"]:
+                out.append(Finding(
+                    BILGI, f"Nakit portföyün yalnızca %{_fmt(pay)}'i",
+                    "Beklenmedik bir harcama ya da fırsat çıktığında pozisyon "
+                    "satmak gerekir.", f"%{_fmt(pay)}", ["dağılım"]))
+        elif pay >= esik["tek_sinif_uyari"]:
+            out.append(Finding(
+                DIKKAT, f"{sinif} portföyün %{_fmt(pay)}'i",
+                f"Portföyün neredeyse yarısı tek bir varlık sınıfında. Bu "
+                f"sınıfı etkileyen bir gelişme portföyün tamamını aynı yönde "
+                f"hareket ettirir.", f"%{_fmt(pay)}", ["dağılım"]))
+
+    dagilim = " · ".join(f"{s} %{_fmt(_yuzde(v, toplam))}"
+                         for s, v in grup.items())
+    out.append(Finding(BILGI, "Varlık sınıfı dağılımı", dagilim, "",
+                       ["dağılım"]))
+    return out
+
+
+def _kural_para_birimi(df: pd.DataFrame, toplam: float) -> list[Finding]:
+    out: list[Finding] = []
+    if "Para Birimi" not in df.columns:
+        return out
+    grup = (df.groupby("Para Birimi")["Değer (TRY)"].sum(min_count=1)
+              .dropna().sort_values(ascending=False))
+    if grup.empty:
+        return out
+
+    try_pay = _yuzde(float(grup.get("TRY", 0.0)), toplam)
+    doviz_pay = 100.0 - try_pay if try_pay == try_pay else float("nan")
+    dagilim = " · ".join(f"{p} %{_fmt(_yuzde(v, toplam))}"
+                         for p, v in grup.items())
+
+    out.append(Finding(
+        BILGI, f"Döviz cinsi varlıklar portföyün %{_fmt(doviz_pay)}'i",
+        f"{dagilim}. Not: BIST hisseleri ve TL fonlar TRY sayılır; bunların "
+        f"bir kısmı (yabancı teknoloji fonları, eurobond fonu, emtia fonları) "
+        f"TL fiyatlansa da esasen döviz/emtia riski taşır, yani gerçek döviz "
+        f"maruziyetiniz bu orandan yüksektir.",
+        f"%{_fmt(doviz_pay)}", ["kur"]))
+    return out
+
+
+def _kural_veri_sagligi(df: pd.DataFrame, toplam: float) -> list[Finding]:
+    """Sayıların GÜVENİLİRLİĞİ — yorumdan önce gelmesi gereken kontroller."""
+    out: list[Finding] = []
+
+    if "Fiyat OK" in df.columns:
+        eksik = df[~df["Fiyat OK"]]
+        if not eksik.empty:
+            adlar = ", ".join(str(x) for x in eksik["Etiket"].head(10))
+            out.append(Finding(
+                KRITIK, f"{len(eksik)} varlığın fiyatı çekilemedi",
+                f"Bu satırlar toplamlara DAHİL DEĞİL, yani portföy değeriniz "
+                f"olduğundan düşük görünüyor: {adlar}"
+                + (" …" if len(eksik) > 10 else ""),
+                f"{len(eksik)} satır", ["veri"]))
+
+    if "Değerleme" in df.columns:
+        kova = df[df["Değerleme"] == "Diğer"]
+        if not kova.empty:
+            pay = _yuzde(float(kova["Değer (TRY)"].sum(skipna=True)), toplam)
+            out.append(Finding(
+                DIKKAT if pay >= 5 else BILGI,
+                f"Portföyün %{_fmt(pay)}'i elle girilen tutarla değerleniyor",
+                f"{len(kova)} satırda adet yok; değer en son yazdığınız tutarda "
+                f"sabit duruyor ve piyasayla birlikte güncellenmiyor. Bu "
+                f"satırlar eskidikçe portföy değeri gerçeklikten uzaklaşır.",
+                f"%{_fmt(pay)}", ["veri"]))
+
+    if {"Maliyet", "Adet"} <= set(df.columns):
+        sifir = df[(df["Adet"] > 0) & (df["Maliyet"] <= 0)]
+        if not sifir.empty:
+            adlar = ", ".join(str(x) for x in sifir["Etiket"])
+            out.append(Finding(
+                DIKKAT, f"{len(sifir)} pozisyonun maliyeti sıfır: {adlar}",
+                "Maliyet sıfırken kâr/zarar yüzdesi sonsuza gider ve portföy "
+                "toplam K/Z'sini bozar. Gerçek maliyeti girmeden bu satırların "
+                "getirisi okunamaz.", "", ["veri"]))
+
+    if {"Para Birimi", "Maliyet Para Birimi"} <= set(df.columns):
+        farkli = df[df["Para Birimi"] != df["Maliyet Para Birimi"]]
+        if not farkli.empty:
+            out.append(Finding(
+                BILGI, f"{len(farkli)} satırda maliyet farklı para biriminde",
+                "Fiyat bir para biriminde, maliyet başka birinde tutuluyor "
+                "(ör. BIST hissesinin fiyatı TL, maliyeti USD). Çevrim her "
+                "açılışta güncel kurla yapıldığı için bu satırların K/Z "
+                "yüzdesi kur hareketiyle de değişir.",
+                f"{len(farkli)} satır", ["veri"]))
+    return out
+
+
+def _kural_borc(df: pd.DataFrame, toplam: float,
+                esik: dict[str, float]) -> list[Finding]:
+    out: list[Finding] = []
+    if "Ana Sınıf" not in df.columns:
+        return out
+    borc = df[df["Ana Sınıf"] == "Yükümlülük"]
+    if borc.empty:
+        return out
+    tutar = abs(float(borc["Değer (TRY)"].sum(skipna=True)))
+    oran = _yuzde(tutar, toplam)
+    out.append(Finding(
+        DIKKAT if oran >= esik["borc_orani_uyari"] else BILGI,
+        f"Yükümlülükler varlıkların %{_fmt(oran)}'i",
+        f"Toplam borç {_fmt(tutar, 0)} TL. Net değeriniz bu tutar düşülerek "
+        f"hesaplanıyor.", f"%{_fmt(oran)}", ["borç"]))
+    return out
+
+
+def _kural_pozisyon_getirisi(df: pd.DataFrame,
+                             esik: dict[str, float]) -> list[Finding]:
+    out: list[Finding] = []
+    if "K/Z %" not in df.columns:
+        return out
+    gecerli = df[df["K/Z %"].notna() & (df["Maliyet (TRY)"] > 0)]
+    if gecerli.empty:
+        return out
+
+    zarar = gecerli[gecerli["K/Z %"] <= esik["buyuk_zarar"]].sort_values("K/Z %")
+    if not zarar.empty:
+        satirlar = ", ".join(f"{r['Etiket']} %{_fmt(r['K/Z %'])}"
+                             for _, r in zarar.head(8).iterrows())
+        out.append(Finding(
+            DIKKAT, f"{len(zarar)} pozisyon maliyetinin %{abs(esik['buyuk_zarar']):.0f}"
+                    f"'inden fazla altında",
+            satirlar + (" …" if len(zarar) > 8 else ""),
+            "", ["getiri"]))
+
+    kar = gecerli[gecerli["K/Z %"] >= esik["buyuk_kar"]].sort_values(
+        "K/Z %", ascending=False)
+    if not kar.empty:
+        satirlar = ", ".join(f"{r['Etiket']} +%{_fmt(r['K/Z %'])}"
+                             for _, r in kar.head(8).iterrows())
+        out.append(Finding(
+            IYI, f"{len(kar)} pozisyon maliyetinin iki katından fazla",
+            satirlar + (" …" if len(kar) > 8 else ""), "", ["getiri"]))
+    return out
+
+
+def _kural_ayni_varlik(df: pd.DataFrame, toplam: float) -> list[Finding]:
+    """
+    Aynı varlığın farklı hesaplardaki parçaları tek tek küçük görünür ama
+    TOPLAM maruziyet büyük olabilir — yoğunlaşma tam olarak burada gizlenir.
+    """
+    out: list[Finding] = []
+    if "Yahoo Sembol" not in df.columns:
+        return out
+    grup = df.groupby("Yahoo Sembol").agg(
+        deger=("Değer (TRY)", "sum"), adet=("Yahoo Sembol", "size"))
+    coklu = grup[grup["adet"] > 1].sort_values("deger", ascending=False)
+    if coklu.empty:
+        return out
+    satirlar = ", ".join(
+        f"{sym} ({int(r['adet'])} hesap, %{_fmt(_yuzde(r['deger'], toplam))})"
+        for sym, r in coklu.head(6).iterrows())
+    out.append(Finding(
+        BILGI, f"{len(coklu)} varlık birden fazla hesapta duruyor",
+        f"Tek tek bakıldığında küçük görünen bu satırların toplam maruziyeti "
+        f"daha büyük: {satirlar}" + (" …" if len(coklu) > 6 else ""),
+        "", ["yoğunlaşma"]))
+    return out
+
+
+def _kural_donem_hareketi(df: pd.DataFrame,
+                          sutun: str = "1 Ay %") -> list[Finding]:
+    out: list[Finding] = []
+    if sutun not in df.columns:
+        return out
+    gecerli = df[df[sutun].notna() & (df["Değer (TRY)"] > 0)]
+    if len(gecerli) < 3:
+        return out
+
+    agirlikli = ((gecerli[sutun] * gecerli["Değer (TRY)"]).sum()
+                 / gecerli["Değer (TRY)"].sum())
+    sirali = gecerli.sort_values(sutun, ascending=False)
+    en_iyi = ", ".join(f"{r['Etiket']} %{_fmt(r[sutun])}"
+                       for _, r in sirali.head(3).iterrows())
+    en_kotu = ", ".join(f"{r['Etiket']} %{_fmt(r[sutun])}"
+                        for _, r in sirali.tail(3).iloc[::-1].iterrows())
+    out.append(Finding(
+        BILGI, f"Son 1 ayda portföy %{_fmt(agirlikli)} hareket etti",
+        f"En çok yükselen: {en_iyi}. En çok gerileyen: {en_kotu}. "
+        f"(Fiyatı ve geçmişi çekilebilen {len(gecerli)} pozisyon üzerinden, "
+        f"değere göre ağırlıklı.)",
+        f"%{_fmt(agirlikli)}", ["hareket"]))
+    return out
+
+
+# --------------------------------------------------------------------------
+# ANA GİRİŞ
+# --------------------------------------------------------------------------
+KURALLAR = (_kural_veri_sagligi, _kural_yogunlasma, _kural_sinif_dagilimi,
+            _kural_para_birimi, _kural_ayni_varlik, _kural_borc,
+            _kural_pozisyon_getirisi, _kural_donem_hareketi)
+
+
+def analyze(df: pd.DataFrame,
+            esik: dict[str, float] | None = None) -> list[Finding]:
+    """Tabloyu tarar, bulguları önem sırasına dizilmiş olarak döndürür."""
+    if df is None or df.empty or "Değer (TRY)" not in df.columns:
+        return []
+    esik = {**EŞIKLER, **(esik or {})}
+
+    varlik = df[df["Ana Sınıf"] != "Yükümlülük"] if "Ana Sınıf" in df.columns else df
+    toplam = float(varlik["Değer (TRY)"].sum(skipna=True))
+    if not toplam or toplam != toplam or toplam <= 0:
+        return []
+
+    bulgular: list[Finding] = []
+    for kural in KURALLAR:
+        try:
+            if kural in (_kural_pozisyon_getirisi,):
+                bulgular.extend(kural(varlik, esik))
+            elif kural in (_kural_para_birimi, _kural_ayni_varlik):
+                bulgular.extend(kural(varlik, toplam))
+            elif kural is _kural_donem_hareketi:
+                bulgular.extend(kural(varlik))
+            elif kural is _kural_veri_sagligi:
+                bulgular.extend(kural(df, toplam))
+            else:
+                bulgular.extend(kural(varlik if kural is not _kural_borc else df,
+                                      toplam, esik))
+        except Exception:                                   # noqa: BLE001
+            # Tek bir kuralın patlaması bütün analizi düşürmesin.
+            continue
+
+    bulgular.sort(key=lambda f: SEVIYE_SIRA.get(f.seviye, 9))
+    return bulgular
+
+
+def ozet_sayilar(df: pd.DataFrame) -> dict[str, float]:
+    """Analiz sekmesinin üst şeridi için birkaç tek sayı."""
+    bos = {"pozisyon": 0, "etkin": float("nan"), "hhi": float("nan"),
+           "ilk5": float("nan"), "doviz_pay": float("nan")}
+    if df is None or df.empty or "Değer (TRY)" not in df.columns:
+        return bos
+    varlik = df[df["Ana Sınıf"] != "Yükümlülük"] if "Ana Sınıf" in df.columns else df
+    canli = varlik[varlik["Değer (TRY)"].notna() & (varlik["Değer (TRY)"] > 0)]
+    toplam = float(canli["Değer (TRY)"].sum(skipna=True))
+    if not toplam:
+        return bos
+
+    agirliklar = sorted((_yuzde(v, toplam) for v in canli["Değer (TRY)"]),
+                        reverse=True)
+    doviz = float(canli[canli.get("Para Birimi", "TRY") != "TRY"]
+                  ["Değer (TRY)"].sum(skipna=True)) \
+        if "Para Birimi" in canli.columns else float("nan")
+    return {
+        "pozisyon": len(canli),
+        "etkin": etkin_pozisyon_sayisi(agirliklar),
+        "hhi": hhi(agirliklar),
+        "ilk5": sum(agirliklar[:5]),
+        "doviz_pay": _yuzde(doviz, toplam),
+    }
+
+# ==========================================================================
 # KAYNAK: app.py
 # ==========================================================================
 
@@ -2433,7 +3459,7 @@ class _Namespace:
             raise AttributeError(name) from exc
 
 
-an = hist = imp = px = _Namespace()
+an = hist = imp = ins = px = _Namespace()
 
 
 
@@ -2673,6 +3699,57 @@ st.markdown(
     }
     /* Uyarı / bilgi kutuları */
     div[data-testid="stAlert"] { border-radius: 11px; border: 1px solid var(--line); }
+
+    /* =====================================================================
+       SON ÇARE OKUNURLUK KATMANI
+       .streamlit/config.toml yüklenmemişse Streamlit uygulamayı KENDİ AÇIK
+       temasıyla çizer: yazı rengi koyu kalır, zemin ise buradaki CSS ile
+       siyah olur — sonuç siyah üstüne siyah, başlıklar ve butonlar okunmaz.
+       Tek tek seçici avlamak Streamlit sürümleriyle sürekli kırıldığı için
+       metin rengini GENİŞ kapsamda zorluyoruz; hemen altındaki blok da
+       renkli olması gereken öğeleri geri alıyor. Sıra önemli: eşit
+       özgüllükte sonra gelen kural kazanır.
+       ===================================================================== */
+    :root { color-scheme: dark; }
+    html, body, .stApp, [data-testid="stAppViewContainer"],
+    [data-testid="stHeader"], [data-testid="stToolbar"] {
+      background-color: var(--bg) !important;
+    }
+    .stApp, .stApp p, .stApp span, .stApp div, .stApp label, .stApp li,
+    .stApp td, .stApp th, .stApp summary, .stApp small, .stApp strong,
+    .stApp h1, .stApp h2, .stApp h3, .stApp h4, .stApp h5, .stApp h6,
+    [data-testid="stMarkdownContainer"], [data-testid="stMarkdownContainer"] *,
+    [data-testid="stWidgetLabel"], [data-testid="stWidgetLabel"] *,
+    [data-baseweb="select"] *, [data-baseweb="popover"] *,
+    [data-testid="stExpander"] * {
+      color: var(--ink) !important;
+    }
+
+    /* --- Geri alınanlar: renkli kalması gereken öğeler ------------------- */
+    .nx-section, .kpi-label, .kpi-sub, .nx-meta { color: var(--ink-3) !important; }
+    .nx-meta b { color: var(--ink-2) !important; }
+    .kpi-value { color: var(--ink) !important; }
+    .kpi-value.pos, .kpi-sub.pos, .badge.pos { color: var(--pos) !important; }
+    .kpi-value.neg, .kpi-sub.neg, .badge.neg { color: var(--neg) !important; }
+    .nx-brand .tag { color: var(--bg) !important; }
+    a, a:visited, a * { color: var(--accent) !important; }
+    .stTabs [aria-selected="true"], .stTabs [aria-selected="true"] * {
+      color: var(--ink) !important;
+    }
+    .stTabs [data-baseweb="tab"] p { color: var(--ink-3) !important; }
+    .stTabs [aria-selected="true"] p { color: var(--ink) !important; }
+    /* Birincil buton koyu zemin üstünde açık yazı DEĞİL, tam tersi */
+    .stButton > button[kind="primary"],
+    .stButton > button[kind="primary"] *,
+    .stFormSubmitButton > button[kind="primary"],
+    .stFormSubmitButton > button[kind="primary"] *,
+    [data-testid="stBaseButton-primary"],
+    [data-testid="stBaseButton-primary"] * {
+      color: #04141a !important;
+    }
+    [data-baseweb="tag"], [data-baseweb="tag"] * { color: var(--accent) !important; }
+    /* Uyarı kutularının kendi ikon renkleri korunsun */
+    div[data-testid="stAlert"] svg { color: inherit !important; }
     </style>
     """,
     unsafe_allow_html=True,
@@ -2849,7 +3926,8 @@ if store.backend == "local":
 for err in snap.errors:
     st.warning(err, icon="⚠️")
 
-df = an.build_dataframe(assets, snap.quotes, snap.fx)
+df = an.build_dataframe(assets, snap.quotes, snap.fx,
+                        changes=snap.changes, change_currency=GOSTER)
 
 # ---------------------------------------------------------------------------
 # KPI ŞERİDİ
@@ -2884,8 +3962,21 @@ if not df.empty:
                 unsafe_allow_html=True)
 
     if t["eksik"]:
-        st.info(f"{t['eksik']} varlığın fiyatı çekilemedi; bu satırlar toplamlara "
-                f"dahil değil.", icon="ℹ️")
+        # Sadece sayı vermek işe yaramıyor — HANGİ varlıklar olduğunu söyle ki
+        # kullanıcı sembolü düzeltebilsin ya da elle değer girebilsin.
+        _eksik_df = df[~df["Fiyat OK"]]
+        _adlar = ", ".join(
+            f"{r['Sembol']} ({r['Yahoo Sembol']})" if r["Sembol"] != r["Yahoo Sembol"]
+            else str(r["Sembol"])
+            for _, r in _eksik_df.head(12).iterrows())
+        if len(_eksik_df) > 12:
+            _adlar += f" … +{len(_eksik_df) - 12}"
+        st.info(f"**{t['eksik']} varlığın fiyatı çekilemedi**, toplamlara dahil "
+                f"değil: {_adlar}\n\nSebebini *Ayarlar → Fiyat kaynağı durumu* "
+                f"tablosundaki **Hata** sütununda görebilirsiniz. Sembol yanlışsa "
+                f"*Varlıklar* sekmesinden düzeltin; fiyatı hiç çekilemeyen bir "
+                f"varlık için *Değer Güncelle* sekmesinden elle tutar girin.",
+                icon="ℹ️")
 
 # ---------------------------------------------------------------------------
 # TARİHÇE — günde bir anlık görüntü
@@ -2928,9 +4019,10 @@ if not df.empty and not df["Değer (TRY)"].isna().all():
 # ---------------------------------------------------------------------------
 # SEKMELER
 # ---------------------------------------------------------------------------
-tab_dag, tab_duzen, tab_kova, tab_ekle, tab_ice, tab_ayar = st.tabs(
-    ["Dağılım", "Varlıklar", "Değer Güncelle", "Yeni Varlık", "İçe Aktar",
-     "Ayarlar"])
+(tab_dag, tab_poz, tab_analiz, tab_hisse, tab_duzen, tab_kova, tab_ekle,
+ tab_ice, tab_ayar) = st.tabs(
+    ["Dağılım", "Pozisyonlar", "Analiz", "Hisse", "Varlıklar",
+     "Değer Güncelle", "Yeni Varlık", "İçe Aktar", "Ayarlar"])
 
 # ============================== DAĞILIM ====================================
 PERIOD_DAYS = {lbl: d for lbl, d in hist.PERIODS}
@@ -3049,23 +4141,70 @@ with tab_dag:
             levels = [LEVEL_COLS["ana_sinif"]]
 
         section("Portföy haritası")
-        tm = an.treemap_data(df, levels)
+        hm_l, hm_r = st.columns([3, 2])
+        RENK_SECENEK = {"Ana sınıf": None, **{v: v for v in an.CHANGE_LABELS.values()}}
+        renk_modu = hm_l.radio(
+            "Renk", list(RENK_SECENEK), horizontal=True, key="tm_renk",
+            help="Kutu ALANI her zaman değeri gösterir. Renk ya varlık "
+                 "sınıfını ya da seçilen dönemdeki yüzde değişimi gösterir.")
+        isi_sutun = RENK_SECENEK[renk_modu]
+        if isi_sutun and isi_sutun not in df.columns:
+            hm_r.warning("Dönem verisi yok.", icon="⚠️")
+            isi_sutun = None
+        elif isi_sutun:
+            _kapsam = int(df[isi_sutun].notna().sum())
+            hm_r.caption(
+                f"{_kapsam}/{len(df)} varlık için değişim hesaplandı · "
+                f"yüzdeler **{GOSTER}** cinsinden"
+                + ("" if GOSTER == "TRY" else " (kur etkisi hariç)"))
+
+        tm = an.treemap_data(df, levels, change_col=isi_sutun)
+        # customdata: [0] kendi para birimindeki tutar, [1] dönem değişimi
+        _tm_custom = [
+            [dogal or f"{PARA_ISARETI}{deger * GOSTER_ORAN:,.0f}",
+             "—" if pct is None else f"{pct:+.2f}%"]
+            for dogal, deger, pct in zip(tm["natives"], tm["values"], tm["changes"])
+        ]
+        # Isı modunda yazı rengi kutunun rengine göre seçilir (kontrast >= 4.5:1)
+        _yazi_rengi = tm["text_colors"] if isi_sutun else "#ececf1"
+        _alt_satir = ("%{customdata[1]}" if isi_sutun else "%{percentParent}")
+
         fig_tm = go.Figure(go.Treemap(
             ids=tm["ids"], labels=tm["labels"], parents=tm["parents"],
             values=[v * GOSTER_ORAN for v in tm["values"]],
             branchvalues="total",
+            customdata=_tm_custom,
             marker=dict(colors=tm["colors"], line=dict(color="#050506", width=2),
                         cornerradius=6),
-            textinfo="label+value+percent parent",
-            texttemplate=("<b>%{label}</b><br>" + PARA_ISARETI +
-                          "%{value:,.0f}<br>%{percentParent}"),
-            textfont=dict(size=13, color="#ececf1"),
-            hovertemplate="<b>%{id}</b><br>" + PARA_ISARETI + "%{value:,.0f}"
-                          "<br>Üst grubun %{percentParent} kadarı<extra></extra>",
+            textinfo="label+text",
+            texttemplate="<b>%{label}</b><br>%{customdata[0]}<br>" + _alt_satir,
+            textfont=dict(size=13, color=_yazi_rengi),
+            hovertemplate=(
+                "<b>%{id}</b><br>%{customdata[0]}"
+                "<br>" + PARA_ISARETI + "%{value:,.0f}"
+                "<br>Dönem değişimi %{customdata[1]}"
+                "<br>Üst grubun %{percentParent} kadarı<extra></extra>"),
             pathbar=dict(visible=True, thickness=22),
         ))
         fig_tm.update_layout(height=520, **CHART_LAYOUT)
         st.plotly_chart(fig_tm, width="stretch")
+
+        if isi_sutun:
+            # Renk tek başına kimlik taşımasın diye her kutuda yüzde YAZILI;
+            # bu şerit de rampanın nasıl okunacağını gösteriyor.
+            _lejant = "".join(
+                f"<span style='display:inline-block;padding:.16rem .5rem;"
+                f"background:{renk};color:{an.text_on(renk)};font-size:.72rem;"
+                f"border-radius:4px;margin-right:3px'>"
+                f"{'≤' if i == 0 else '≥' if i == len(an.HEAT_STEPS) - 1 else ''}"
+                f"{esik:+.1f}%</span>"
+                for i, (esik, renk) in enumerate(an.HEAT_STEPS))
+            st.markdown(
+                f"<div style='margin:-.4rem 0 .2rem'>{_lejant}"
+                f"<span style='display:inline-block;padding:.16rem .5rem;"
+                f"background:{an.HEAT_UNKNOWN};color:#a0a0ab;font-size:.72rem;"
+                f"border-radius:4px;margin-left:6px'>veri yok</span></div>",
+                unsafe_allow_html=True)
 
         c1, c2 = st.columns([1, 1])
         with c1:
@@ -3143,6 +4282,412 @@ with tab_dag:
                              column_config={f"Değer ({GOSTER})": st.column_config.NumberColumn(
                                  format="%.0f"),
                                  "Pay %": st.column_config.NumberColumn(format="%.2f%%")})
+
+# ============================== POZİSYONLAR =================================
+with tab_poz:
+    if df.empty:
+        st.info("Henüz pozisyon yok.")
+    else:
+        _don = list(an.PERIOD_GUN)
+        _mevcut_don = [d for d in _don if d in df.columns]
+        _sec = st.radio("Sırala / vurgula", ["Ağırlık"] + _mevcut_don + ["Toplam"],
+                        horizontal=True, key="poz_donem",
+                        help="Tablo bu sütuna göre sıralanır. Bütün dönemler "
+                             "tabloda durur; başlıklara tıklayıp kendiniz de "
+                             "sıralayabilirsiniz.")
+
+        _kapsam = st.columns([2, 2, 3])
+        _sinif = _kapsam[0].multiselect(
+            "Ana sınıf", sorted(df["Ana Sınıf"].dropna().unique()),
+            key="poz_sinif")
+        _hesap = _kapsam[1].multiselect(
+            "Hesap", sorted(x for x in df["Hesap"].dropna().unique() if x),
+            key="poz_hesap")
+
+        _t = df.copy()
+        if _sinif:
+            _t = _t[_t["Ana Sınıf"].isin(_sinif)]
+        if _hesap:
+            _t = _t[_t["Hesap"].isin(_hesap)]
+
+        # Kendi para biriminde fiyat/maliyet; değer seçili para biriminde.
+        _t["Değer"] = _t["Değer (TRY)"] * GOSTER_ORAN
+        _t["Toplam %"] = _t["K/Z %"]
+        _t["K/Z"] = _t["K/Z (TRY)"] * GOSTER_ORAN
+
+        _sirala = {"Ağırlık": "Ağırlık %", "Toplam": "Toplam %"}.get(_sec, _sec)
+        _t = _t.sort_values(_sirala, ascending=False, na_position="last")
+
+        _sutunlar = (["Etiket", "Hesap", "Para Birimi", "Ağırlık %", "Adet",
+                      "Maliyet", "Fiyat", "Değer", "K/Z", "Toplam %"]
+                     + _mevcut_don)
+        _gorunum = _t[[c for c in _sutunlar if c in _t.columns]].rename(
+            columns={"Etiket": "Sembol", "Maliyet": "Ort. Maliyet",
+                     "Fiyat": "Güncel Fiyat", "Değer": f"Değer ({GOSTER})",
+                     "K/Z": f"K/Z ({GOSTER})"})
+
+        _cfg = {
+            "Ağırlık %": st.column_config.ProgressColumn(
+                format="%.2f%%", min_value=0.0,
+                max_value=float(_t["Ağırlık %"].max(skipna=True) or 100)),
+            "Adet": st.column_config.NumberColumn(format="%.4f"),
+            "Ort. Maliyet": st.column_config.NumberColumn(format="%.4f"),
+            "Güncel Fiyat": st.column_config.NumberColumn(format="%.4f"),
+            f"Değer ({GOSTER})": st.column_config.NumberColumn(format="%.0f"),
+            f"K/Z ({GOSTER})": st.column_config.NumberColumn(format="%+.0f"),
+            "Toplam %": st.column_config.NumberColumn(format="%+.2f%%"),
+        }
+        for _d in _mevcut_don:
+            _cfg[_d] = st.column_config.NumberColumn(format="%+.2f%%")
+
+        st.dataframe(_gorunum, width="stretch", hide_index=True,
+                     column_config=_cfg, height=560)
+
+        _eksik_don = [d for d in _don if d not in df.columns]
+        st.caption(
+            f"{len(_gorunum)} pozisyon · fiyat ve maliyet varlığın KENDİ para "
+            f"biriminde, değer {GOSTER} cinsinden · dönem getirileri {GOSTER} "
+            f"bazlı"
+            + (f" · şu dönemler için yeterli geçmiş yok: {', '.join(_eksik_don)}"
+               if _eksik_don else ""))
+        st.download_button(
+            "⬇️ CSV indir", _gorunum.to_csv(index=False).encode("utf-8-sig"),
+            "pozisyonlar.csv", "text/csv")
+
+# ================================ ANALİZ ====================================
+with tab_analiz:
+    if df.empty:
+        st.info("Analiz için önce portföyünüzü doldurun.")
+    else:
+        _oz = ins.ozet_sayilar(df)
+        a1, a2, a3, a4 = st.columns(4)
+        a1.markdown(kpi("Pozisyon", f"{int(_oz['pozisyon'])}",
+                        "fiyatı çekilebilen"), unsafe_allow_html=True)
+        a2.markdown(kpi("Etkin pozisyon", f"{_oz['etkin']:,.1f}",
+                        "ağırlıklar eşit olsaydı kaç pozisyona denk"),
+                    unsafe_allow_html=True)
+        a3.markdown(kpi("En büyük 5", f"%{_oz['ilk5']:,.1f}",
+                        "portföydeki payı"), unsafe_allow_html=True)
+        a4.markdown(kpi("Döviz cinsi", f"%{_oz['doviz_pay']:,.1f}",
+                        "TRY dışı fiyatlanan"), unsafe_allow_html=True)
+
+        st.caption(
+            "**Bunlar yatırım tavsiyesi değildir.** Her madde sizin kendi "
+            "rakamlarınızdan aritmetikle çıkan bir gözlemdir; ne alınıp "
+            "satılacağına dair bir yargı ya da piyasa tahmini içermez. "
+            "Ben finansal danışman değilim — bu bölüm karar vermek için "
+            "gereken olguları bir araya getirir, kararı sizin yerinize vermez.")
+
+        _bulgular = ins.analyze(df)
+        if not _bulgular:
+            st.info("Bulgu üretilemedi (fiyat verisi yetersiz olabilir).")
+        else:
+            _sayim = {}
+            for _b in _bulgular:
+                _sayim[_b.seviye] = _sayim.get(_b.seviye, 0) + 1
+            _secim = st.multiselect(
+                "Seviye", [s for s in ins.SEVIYE_SIRA if s in _sayim],
+                default=[s for s in (ins.KRITIK, ins.DIKKAT, ins.BILGI, ins.IYI)
+                         if s in _sayim],
+                format_func=lambda s: f"{ins.SEVIYE_ETIKET[s]} ({_sayim[s]})",
+                key="analiz_seviye")
+
+            for _b in _bulgular:
+                if _b.seviye not in _secim:
+                    continue
+                with st.container(border=True):
+                    _sol, _sag = st.columns([5, 1])
+                    _sol.markdown(
+                        f"**{ins.SEVIYE_ETIKET[_b.seviye]} · {_b.baslik}**")
+                    if _b.metrik:
+                        _sag.markdown(
+                            f"<div style='text-align:right;font-size:1.05rem;"
+                            f"font-weight:700'>{_b.metrik}</div>",
+                            unsafe_allow_html=True)
+                    st.markdown(
+                        f"<div style='color:var(--ink-2);font-size:.88rem'>"
+                        f"{_b.detay}</div>", unsafe_allow_html=True)
+
+        # ----------------------------- KARŞILAŞTIRMA --------------------
+        section("Piyasayla karşılaştırma")
+        _k1, _k2 = st.columns([2, 3])
+        _kdon = _k1.selectbox("Dönem", list(an.PERIOD_GUN),
+                              index=len(an.PERIOD_GUN) - 1, key="kars_donem")
+        _kolcut = _k2.multiselect(
+            "Ölçütler", list(snap.benchmarks),
+            default=[o for o in ("BIST 100", "S&P 500", "Altın (gram)")
+                     if o in snap.benchmarks],
+            key="kars_olcut")
+
+        _gun = an.PERIOD_GUN[_kdon]
+        _pser = an.portfoy_getiri_serisi(
+            df[df["Ana Sınıf"] != "Yükümlülük"], snap.series, _gun)
+        _ktab = an.karsilastirma_tablosu(
+            _pser, {k: v for k, v in snap.benchmarks.items() if k in _kolcut},
+            _gun)
+
+        if _ktab.empty:
+            st.info("Karşılaştırma için yeterli geçmiş fiyat verisi yok.")
+        else:
+            _cmap = an.color_map([c for c in _ktab.columns if c != "Portföyüm"])
+            _fig = go.Figure()
+            for _sutun in _ktab.columns:
+                _portfoy = _sutun == "Portföyüm"
+                _fig.add_trace(go.Scatter(
+                    x=_ktab.index, y=_ktab[_sutun], name=_sutun, mode="lines",
+                    line=dict(width=3 if _portfoy else 2,
+                              color=an.ACCENT if _portfoy
+                              else _cmap.get(_sutun, an.OTHER_COLOR)),
+                    hovertemplate="%{x}<br>" + _sutun +
+                                  " %{y:,.1f}<extra></extra>"))
+            _fig.add_hline(y=100, line=dict(color="#3a3a45", width=1, dash="dot"))
+            _fig.update_layout(
+                height=360,
+                yaxis=dict(gridcolor="#17171d", zeroline=False,
+                           title="başlangıç = 100"),
+                xaxis=dict(showgrid=False),
+                legend=dict(orientation="h", y=-0.18), **CHART_LAYOUT)
+            st.plotly_chart(_fig, width="stretch")
+
+            _son = _ktab.iloc[-1] - 100.0
+            _ozet = pd.DataFrame({"Getiri %": _son}).sort_values(
+                "Getiri %", ascending=False)
+            st.dataframe(_ozet, width="stretch", column_config={
+                "Getiri %": st.column_config.NumberColumn(format="%+.2f%%")})
+            st.caption(
+                "**Portföy serisi BUGÜNKÜ ağırlıklarla geriye dönük "
+                "hesaplanır** — 'şu anki portföyü o gün de elimde tutsaydım' "
+                "senaryosudur, gerçekleşmiş performansınız değildir; geçmişteki "
+                "alım satımları bilmiyor. Buna karşılık para giriş/çıkışlarından "
+                "etkilenmediği için bir endeksle yan yana konabilecek tek seri "
+                "budur. Hepsi TL bazlıdır: yabancı endeksler kur etkisi dahil "
+                "gösterilir.")
+
+        # ----------------------------- ÇEŞİTLENME ------------------------
+        section("Çeşitlenme ve hedef ağırlık")
+        _dseviye = st.selectbox(
+            "Kırılım", [LEVEL_COLS[k] for k in ("ana_sinif", "alt_sinif",
+                                                "sektor", "hesap")],
+            key="denge_seviye")
+
+        _dagilim = an.allocation(df[df["Ana Sınıf"] != "Yükümlülük"], _dseviye)
+        if not _dagilim.empty:
+            _paylar = list(_dagilim["Pay %"].dropna())
+            _hhi = ins.hhi(_paylar)
+            _etkin = ins.etkin_pozisyon_sayisi(_paylar)
+            _d1, _d2, _d3 = st.columns(3)
+            _d1.markdown(kpi(f"{_dseviye} sayısı", f"{len(_dagilim)}", ""),
+                         unsafe_allow_html=True)
+            _d2.markdown(kpi("Etkin grup sayısı", f"{_etkin:,.1f}",
+                             "ağırlıklar eşit olsaydı kaça denk"),
+                         unsafe_allow_html=True)
+            _d3.markdown(kpi("En büyük grup",
+                             f"%{_dagilim['Pay %'].max():,.1f}",
+                             str(_dagilim.iloc[0][_dseviye])),
+                         unsafe_allow_html=True)
+
+        with st.expander("Hedef ağırlık belirle ve farkı gör", expanded=False):
+            st.caption(
+                "Hedefleri **siz** giriyorsunuz; uygulama yalnızca aradaki "
+                "farkı TL'ye çeviriyor. Bu bir dağılım önerisi değil, "
+                "'şu ağırlığı istersem ne kadar kaydırmam gerekir' "
+                "hesabıdır. Toplamın 100 olması gerekmez; olmadığında farklar "
+                "yine de tek tek doğrudur.")
+            _hedefler = {}
+            _hk = st.columns(3)
+            for _i, (_, _sat) in enumerate(_dagilim.iterrows()):
+                _ad = str(_sat[_dseviye])
+                _hedefler[_ad] = _hk[_i % 3].number_input(
+                    _ad, min_value=0.0, max_value=100.0,
+                    value=float(round(_sat["Pay %"], 1)), step=0.5,
+                    key=f"hedef_{_dseviye}_{_ad}")
+
+            _denge = an.denge_tablosu(df, _dseviye, _hedefler)
+            if not _denge.empty:
+                _denge_g = _denge.copy()
+                _denge_g["Fark (TRY)"] = _denge_g["Fark (TRY)"] * GOSTER_ORAN
+                _denge_g = _denge_g.rename(
+                    columns={"Fark (TRY)": f"Fark ({GOSTER})"})
+                st.dataframe(
+                    _denge_g, width="stretch", hide_index=True,
+                    column_config={
+                        "Mevcut %": st.column_config.NumberColumn(format="%.2f%%"),
+                        "Hedef %": st.column_config.NumberColumn(format="%.2f%%"),
+                        "Fark puan": st.column_config.NumberColumn(format="%+.2f"),
+                        f"Fark ({GOSTER})": st.column_config.NumberColumn(
+                            format="%+.0f")})
+                _top = float(_denge["Hedef %"].sum())
+                if abs(_top - 100.0) > 0.5:
+                    st.caption(f"Girdiğiniz hedeflerin toplamı %{_top:,.1f} "
+                               f"(100 değil) — farklar yine de tek tek doğru.")
+
+        with st.expander("Eşikleri değiştir"):
+            st.caption("Bulguların hangi noktada uyarıya dönüştüğünü siz "
+                       "belirleyin; değişiklik anında yansır.")
+            _yeni_esik = {}
+            _kolonlar = st.columns(3)
+            for _i, (_ad, _var) in enumerate(ins.EŞIKLER.items()):
+                _yeni_esik[_ad] = _kolonlar[_i % 3].number_input(
+                    _ad.replace("_", " "), value=float(_var),
+                    key=f"esik_{_ad}")
+            if _yeni_esik != ins.EŞIKLER:
+                st.caption(f"{sum(1 for k in _yeni_esik if _yeni_esik[k] != ins.EŞIKLER[k])}"
+                           " eşik değiştirildi — yukarıdaki liste bu değerlerle yenilendi.")
+                _bulgular = ins.analyze(df, _yeni_esik)
+
+# ================================ HİSSE =====================================
+with tab_hisse:
+    _hisseler = df[(df["Ana Sınıf"] == "Hisse Senedi")
+                   & (df["Alt Sınıf"] == "ABD")
+                   & df["Değer (TRY)"].notna()] if not df.empty else df
+
+    if _hisseler is None or _hisseler.empty:
+        st.info("ABD hissesi bulunamadı.")
+    else:
+        st.markdown(
+            f"**{len(_hisseler)} ABD hissesi.** Aşağıdaki veriler "
+            f"**analistlerin ortalama beklentisidir** — ne benim tahminim ne "
+            f"de bir tavsiye. Analist hedefleri sistematik olarak iyimser "
+            f"olmakla bilinir; 'potansiyel' bir vaat değil, beklenti "
+            f"dağılımının ortalamasıdır.")
+
+        @st.cache_resource(ttl=3600, show_spinner=False)
+        def cached_fundamentals(parmak: str, _semboller: list) -> dict:
+            """
+            Analist verisi. Toplu uç nokta olmadığı için sembol başına bir
+            istek gider; bu yüzden otomatik değil DÜĞMEYLE çağrılır ve bir
+            saat önbellekte tutulur. (cache_data değil cache_resource:
+            bkz. cached_snapshot açıklaması.)
+            """
+            return px.fetch_fundamentals(_semboller)
+
+        _sem = sorted(_hisseler["Yahoo Sembol"].unique())
+        _hb1, _hb2 = st.columns([1, 3])
+        if _hb1.button("📊 Analist verisini çek", type="primary",
+                       key="hisse_cek"):
+            st.session_state.hisse_cekildi = True
+            cached_fundamentals.clear()
+        _hb2.caption(f"{len(_sem)} sembol için ayrı ayrı sorgulanır, "
+                     f"15-40 saniye sürebilir. Sonuç 1 saat önbellekte kalır.")
+
+        if st.session_state.get("hisse_cekildi"):
+            with st.spinner("Analist beklentileri çekiliyor…"):
+                try:
+                    _tv = cached_fundamentals("|".join(_sem), _sem)
+                except Exception as exc:                  # noqa: BLE001
+                    _tv = {}
+                    st.error(f"Veri çekilemedi: {type(exc).__name__}: {exc}")
+
+            if not _tv:
+                st.warning("Hiçbir sembol için analist verisi gelmedi.")
+            else:
+                _sat = []
+                for _, _r in _hisseler.iterrows():
+                    _b = _tv.get(_r["Yahoo Sembol"])
+                    if not _b:
+                        continue
+                    _sat.append({
+                        "Sembol": _r["Etiket"], "Şirket": _b.get("ad", ""),
+                        "Sektör": _b.get("sektor", ""),
+                        "Ağırlık %": _r["Ağırlık %"],
+                        "Fiyat": _b.get("fiyat"), "Hedef": _b.get("hedef"),
+                        "Potansiyel %": _b.get("potansiyel"),
+                        "Kâr büyüme %": _b.get("kar_buyume"),
+                        "Gelir büyüme %": _b.get("gelir_buyume"),
+                        "F/K": _b.get("fk"), "İleri F/K": _b.get("ileri_fk"),
+                        "Analist": _b.get("analist_sayisi"),
+                        "Tavsiye": _b.get("tavsiye", ""),
+                    })
+                _fdf = pd.DataFrame(_sat)
+                _yok = sorted(set(_sem) - set(_tv))
+                if _yok:
+                    st.caption(f"Veri gelmeyen semboller: {', '.join(_yok)}")
+
+                def _baloncuk(sutun: str, baslik: str, aciklama: str,
+                              esik: float | None = None):
+                    _v = _fdf[_fdf[sutun].notna()]
+                    if _v.empty:
+                        st.info(f"{baslik}: veri yok.")
+                        return
+                    section(baslik)
+                    st.caption(aciklama)
+                    _ort = float((_v[sutun] * _v["Ağırlık %"]).sum()
+                                 / _v["Ağırlık %"].sum())
+                    _renk = [an.heat_color(x / 4.0) for x in _v[sutun]] \
+                        if esik is None else \
+                        [an.POS_COLOR if x >= esik else an.NEG_COLOR
+                         for x in _v[sutun]]
+                    _f = go.Figure(go.Scatter(
+                        x=_v[sutun], y=_v["Sembol"], mode="markers+text",
+                        marker=dict(
+                            size=_v["Ağırlık %"], sizemode="area",
+                            sizeref=max(_v["Ağırlık %"]) / 1600.0, sizemin=8,
+                            color=_renk, line=dict(color="#050506", width=2)),
+                        text=_v["Sembol"], textposition="middle right",
+                        textfont=dict(size=11, color="#ececf1"),
+                        customdata=_v[["Ağırlık %", "Şirket"]],
+                        hovertemplate="<b>%{y}</b> %{customdata[1]}<br>"
+                                      + sutun + " %{x:,.1f}<br>"
+                                      "Portföy ağırlığı %{customdata[0]:.2f}"
+                                      "<extra></extra>"))
+                    _f.add_vline(x=_ort, line=dict(color=an.ACCENT, width=2,
+                                                   dash="dot"))
+                    if esik is not None:
+                        _f.add_vline(x=esik, line=dict(color="#6e6e7a",
+                                                       width=1, dash="dash"))
+                    _f.update_layout(
+                        height=max(320, 22 * len(_v)),
+                        xaxis=dict(gridcolor="#17171d", zeroline=False,
+                                   ticksuffix="%"),
+                        yaxis=dict(showgrid=False, tickfont=dict(size=10),
+                                   categoryorder="total ascending"),
+                        showlegend=False, **CHART_LAYOUT)
+                    st.plotly_chart(_f, width="stretch")
+                    st.caption(f"Kesikli mavi çizgi: portföyünüzün ağırlıklı "
+                               f"ortalaması (%{_ort:,.1f}). Baloncuk büyüklüğü "
+                               f"portföy ağırlığıdır.")
+
+                _baloncuk("Potansiyel %", "Analist hedefine göre potansiyel",
+                          "Ortalama analist hedef fiyatının bugünkü fiyata "
+                          "göre farkı. Pozitif, analistlerin fiyatı bugünkünün "
+                          "üzerinde beklediği anlamına gelir — gerçekleşeceği "
+                          "anlamına gelmez.", esik=0.0)
+                _baloncuk("Kâr büyüme %", "Beklenen kâr büyümesi",
+                          "Analistlerin önümüzdeki dönem için beklediği kâr "
+                          "büyümesi.")
+
+                section("Tablo")
+                st.dataframe(
+                    _fdf.sort_values("Ağırlık %", ascending=False),
+                    width="stretch", hide_index=True,
+                    column_config={
+                        "Ağırlık %": st.column_config.NumberColumn(format="%.2f%%"),
+                        "Fiyat": st.column_config.NumberColumn(format="$%.2f"),
+                        "Hedef": st.column_config.NumberColumn(format="$%.2f"),
+                        "Potansiyel %": st.column_config.NumberColumn(format="%+.1f%%"),
+                        "Kâr büyüme %": st.column_config.NumberColumn(format="%+.1f%%"),
+                        "Gelir büyüme %": st.column_config.NumberColumn(format="%+.1f%%"),
+                        "F/K": st.column_config.NumberColumn(format="%.1f"),
+                        "İleri F/K": st.column_config.NumberColumn(format="%.1f"),
+                    })
+
+                section("Sektör dağılımı (analist verisine göre)")
+                _sk = (_fdf[_fdf["Sektör"] != ""]
+                       .groupby("Sektör")["Ağırlık %"].sum()
+                       .sort_values(ascending=False))
+                if not _sk.empty:
+                    _sf = go.Figure(go.Bar(
+                        x=_sk.values, y=_sk.index, orientation="h",
+                        marker=dict(color=an.SERIES_COLORS[0], cornerradius=4),
+                        hovertemplate="%{y}<br>%{x:.2f}%<extra></extra>"))
+                    _sf.update_layout(
+                        height=max(260, 30 * len(_sk)),
+                        xaxis=dict(gridcolor="#17171d", ticksuffix="%",
+                                   zeroline=False),
+                        yaxis=dict(showgrid=False), **CHART_LAYOUT)
+                    st.plotly_chart(_sf, width="stretch")
+                    st.caption("Yahoo'nun sektör etiketlerine göre; portföy "
+                               "içindeki ABD hisselerinin ağırlıkları.")
 
 # ======================= VARLIKLAR (TAM DÜZENLEME) ==========================
 with tab_duzen:
@@ -3553,6 +5098,45 @@ with tab_ayar:
             "```toml\n[github]\ntoken  = \"github_pat_...\"\n"
             "repo   = \"kullanici/depo\"\nbranch = \"main\"\n"
             "path   = \"my_assets.json\"\n```")
+    else:
+        st.caption("Jetonun gerçekten yazma yetkisi olup olmadığını sınamak "
+                   "portföyünüzü riske atmaz: sınama, dosyayı kendi mevcut "
+                   "içeriğiyle yeniden yazar.")
+        if st.button("🔍 Depolama iznini sına", key="ayar_depo_sina"):
+            for _ad, _st in (("Portföy", store), ("Tarihçe", hist_store)):
+                try:
+                    _mevcut = _st.load(default=[])
+                except StorageError as exc:
+                    st.error(f"**{_ad} — OKUMA başarısız.** {exc}")
+                    continue
+                try:
+                    _st.save(_mevcut.data, f"izin sınaması ({_ad.lower()})")
+                    st.success(f"**{_ad}** — okuma ve yazma çalışıyor "
+                               f"(`{_st.path}`).")
+                except StorageError as exc:
+                    _metin = str(exc)
+                    st.error(f"**{_ad} — YAZMA başarısız.** {_metin}")
+                    if "not accessible by personal access token" in _metin \
+                            or "HTTP 403" in _metin:
+                        st.markdown(
+                            "Bu mesaj jetonun **yazma yetkisi olmadığını** "
+                            "söyler; depo adı ya da dosya yolu yanlış olsaydı "
+                            "404 alırdınız. GitHub → **Settings → Developer "
+                            "settings → Personal access tokens → "
+                            "Fine-grained tokens** → jetonunuz → "
+                            "**Repository permissions → Contents**'i "
+                            "*Read and write* yapın. Depo bir kuruluşa aitse "
+                            "kuruluş yöneticisinin jetonu ayrıca onaylaması "
+                            "gerekir. Değişiklikten sonra Streamlit'te "
+                            "**Reboot app** deyin.")
+                    elif "HTTP 404" in _metin:
+                        st.markdown(
+                            "404: `repo`, `branch` veya `path` değerlerinden "
+                            "biri yanlış — ya da jeton bu depoyu hiç görmüyor.")
+                    elif "HTTP 409" in _metin or "HTTP 422" in _metin:
+                        st.markdown(
+                            "Dosya başka bir yerden değiştirilmiş. Sayfayı "
+                            "yenileyip tekrar deneyin.")
 
     section("Fiyat kaynağı durumu")
     if not df.empty:

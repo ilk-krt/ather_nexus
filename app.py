@@ -14,8 +14,8 @@ from __future__ import annotations
 # Derleyici üretir. Amacı tek bir soruyu kesin cevaplamak: "yüklediğim dosya
 # gerçekten çalışıyor mu?" Uygulama bunu başlıkta ve Ayarlar'da gösterir;
 # yüklediğiniz dosyanınkiyle aynı değilse yayındaki sürüm eski demektir.
-BUILD_ID = "5b54e35f76"
-BUILD_TIME = "2026-09-24 16:28"
+BUILD_ID = "adbcc5ccb2"
+BUILD_TIME = "2026-09-24 16:54"
 
 
 # ==========================================================================
@@ -473,6 +473,8 @@ def asset_key(item: dict[str, Any]) -> str:
 
 import datetime as dt
 import logging
+import pathlib
+import tempfile
 import time
 from dataclasses import dataclass, field
 from typing import Any, Iterable
@@ -501,6 +503,40 @@ TEFAS_REFERER_YENI = "https://www.tefas.gov.tr/tr/fon-verileri"
 
 TEFAS_URL = "https://www.tefas.gov.tr/api/DB/BindHistoryInfo"   # eski (404)
 TEFAS_REFERER = "https://www.tefas.gov.tr/TarihselVeriler.aspx"
+
+# TEFAS istek sıklığını sınırlıyor (429 Too Many Requests). Eskiden bir fon
+# tipi 429 döndürdüğünde kod pes etmiyor, EKSİK KALAN HER KOD için ayrı ayrı
+# (3 fon tipi x ~20 kod = ~60 istek) tekil denemeye geçiyordu — bu da zaten
+# kızgın olan TEFAS'ı daha da kızdırıp yasağı uzatıyordu. Artık: bir 429
+# görülür görülmez BÜTÜN denemeler o çalıştırma için durur ve birkaç dakikalık
+# bir "sus" süresi başlar; bu süre boyunca hiç istek atılmaz.
+#
+# Sus süresi DİSKE yazılır, salt Python değişkenine değil. Sebebi: tek dosya
+# sürümünde Streamlit her etkileşimde BÜTÜN betiği (bu modülün kodu dahil)
+# baştan çalıştırıyor, bu da modül seviyesindeki sıradan bir değişkeni her
+# seferinde sıfırlardı ve "sus" hiç kalıcı olmazdı. Geçici dosya süreç/betik
+# çalıştırmaları arasında hayatta kalıyor.
+_TEFAS_SUS_SANIYE = 360.0
+_TEFAS_SUS_DOSYA = pathlib.Path(tempfile.gettempdir()) / "aether_tefas_sus.txt"
+
+
+def _tefas_sus_oku() -> float:
+    try:
+        return float(_TEFAS_SUS_DOSYA.read_text().strip())
+    except Exception:
+        return 0.0
+
+
+def _tefas_sus_yaz(zaman: float) -> None:
+    try:
+        _TEFAS_SUS_DOSYA.write_text(str(zaman))
+    except Exception as exc:
+        log.info("TEFAS sus dosyası yazılamadı (önemsiz): %s", exc)
+
+
+def _tefas_429_mi(exc: Exception) -> bool:
+    resp = getattr(exc, "response", None)
+    return getattr(resp, "status_code", None) == 429
 
 
 @dataclass
@@ -791,9 +827,24 @@ def fetch_tefas(codes: Iterable[str], *, lookback_days: int = 15,
 
     `errors` verilirse başarısızlığın GERÇEK sebebi (HTTP kodu / istisna)
     oraya yazılır — kullanıcıya "bulunamadı" yerine nedenini gösterebilmek için.
+
+    429 (Too Many Requests) GÖRÜLÜRSE bütün denemeler hemen durur — daha
+    fazla istek atmak yasağı uzatmaktan başka işe yaramaz — ve bir süreliğine
+    (bkz. _TEFAS_SUS_SANIYE) TEFAS'a hiç istek atılmaz.
     """
     codes = sorted({c.strip().upper() for c in codes if c and c.strip()})
     if not codes:
+        return {}
+
+    simdi = time.time()
+    susana_kadar = _tefas_sus_oku()
+    if simdi < susana_kadar:
+        kalan_dk = int((susana_kadar - simdi) / 60) + 1
+        if errors is not None:
+            errors.append(
+                f"TEFAS çok sık istek nedeniyle geçici olarak sınırladı "
+                f"(429). Yaklaşık {kalan_dk} dakika sonra tekrar denenecek; "
+                f"bu süre içinde hiç istek atılmıyor ki yasak uzamasın.")
         return {}
 
     session = _tefas_session()
@@ -810,6 +861,7 @@ def fetch_tefas(codes: Iterable[str], *, lookback_days: int = 15,
     sorunlar: list[str] = []
     # kod -> {tarih_metni: fiyat} — ısı haritası dönem değişimi için kullanır
     seriler: dict[str, dict[str, float]] = {}
+    sinirlandi = False   # 429 görüldü mü — görülürse bütün denemeler durur
 
     def isle(rows) -> None:
         for r in rows:
@@ -841,21 +893,35 @@ def fetch_tefas(codes: Iterable[str], *, lookback_days: int = 15,
             sorunlar.append(f"yeni API/{fontip}: {type(exc).__name__}: "
                             f"{str(exc)[:110]}")
             log.warning("TEFAS yeni API %s başarısız: %s", fontip, exc)
+            if _tefas_429_mi(exc):
+                sinirlandi = True
+                break
+        time.sleep(0.25)   # ardışık isteklerin hızını kes — TEFAS'ı ürkütme
 
     # 2) Toplu istek bazılarını getirmediyse tek tek sor (fon tipi bilinmiyor
-    #    olabilir ya da toplu sonuç kırpılmış olabilir).
-    for kod in sorted(aranan - set(en_guncel)):
-        for fontip in TEFAS_FON_TIPLERI:
-            try:
-                isle(_tefas_rows_yeni(session, fontip, start, end, timeout,
-                                      fon_kodu=kod))
-            except Exception as exc:
-                log.info("TEFAS tekil %s/%s: %s", kod, fontip, exc)
-            if kod in en_guncel:
+    #    olabilir ya da toplu sonuç kırpılmış olabilir). 429 görülürse HİÇ
+    #    başlamaz — 20 koda kadar tek tek istek atmak zaten 429'un sebebiydi.
+    if not sinirlandi:
+        for kod in sorted(aranan - set(en_guncel)):
+            if sinirlandi:
                 break
+            for fontip in TEFAS_FON_TIPLERI:
+                try:
+                    isle(_tefas_rows_yeni(session, fontip, start, end, timeout,
+                                          fon_kodu=kod))
+                except Exception as exc:
+                    log.info("TEFAS tekil %s/%s: %s", kod, fontip, exc)
+                    if _tefas_429_mi(exc):
+                        sorunlar.append(f"yeni API/tekil {kod}: 429 Too Many Requests")
+                        sinirlandi = True
+                        break
+                if kod in en_guncel:
+                    break
+            time.sleep(0.25)
 
-    # 3) Son çare: eski form-encoded API (TEFAS geri alırsa çalışsın)
-    if aranan - set(en_guncel):
+    # 3) Son çare: eski form-encoded API (TEFAS geri alırsa çalışsın).
+    #    429 görüldüyse bu da atlanır.
+    if not sinirlandi and aranan - set(en_guncel):
         for fontip in TEFAS_FON_TIPLERI:
             if not aranan - set(en_guncel):
                 break
@@ -863,6 +929,17 @@ def fetch_tefas(codes: Iterable[str], *, lookback_days: int = 15,
                 isle(_tefas_rows_eski(session, fontip, start, end, timeout))
             except Exception as exc:
                 log.info("TEFAS eski API %s: %s", fontip, exc)
+                if _tefas_429_mi(exc):
+                    sinirlandi = True
+                    break
+
+    if sinirlandi:
+        _tefas_sus_yaz(simdi + _TEFAS_SUS_SANIYE)
+        if errors is not None:
+            errors.append(
+                "TEFAS çok sık istek nedeniyle sizi geçici olarak sınırladı "
+                "(429 Too Many Requests). Bir süre (birkaç dakika) hiç "
+                "TEFAS isteği atılmayacak, sonra otomatik tekrar denenecek.")
 
     if errors is not None and sorunlar:
         errors.extend(sorunlar)

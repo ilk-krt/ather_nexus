@@ -14,8 +14,8 @@ from __future__ import annotations
 # Derleyici üretir. Amacı tek bir soruyu kesin cevaplamak: "yüklediğim dosya
 # gerçekten çalışıyor mu?" Uygulama bunu başlıkta ve Ayarlar'da gösterir;
 # yüklediğiniz dosyanınkiyle aynı değilse yayındaki sürüm eski demektir.
-BUILD_ID = "f0df2285b9"
-BUILD_TIME = "2026-09-24 18:44"
+BUILD_ID = "118d730c96"
+BUILD_TIME = "2026-10-02 07:15"
 
 
 # ==========================================================================
@@ -962,6 +962,114 @@ def fetch_tefas(codes: Iterable[str], *, lookback_days: int = 15,
 
 
 # ---------------------------------------------------------------------------
+# FONOLOJI — TEFAS'IN DOĞRUDAN ENGELLENMESİNE KARŞI ÜÇÜNCÜ TARAF YEDEK
+# ---------------------------------------------------------------------------
+# TEFAS'ın kendi sitesi WAF (bot koruma) ile bulut sunucu IP'lerini (Streamlit
+# Cloud dahil) engelleyebiliyor — bkz. fetch_tefas üstündeki not. Fonoloji
+# (fonoloji.com), TEFAS'ın herkese açık verisini kendi altyapısından toplayıp
+# düz bir REST API olarak sunan üçüncü taraf bir servis; ücretsiz katmanı
+# kredi kartı istemeden ayda 15.000 istek veriyor. RESMİ TEFAS DEĞİL — veriler
+# TEFAS'tan türetilmiş ama birebir aynı anda güncellenmeyebilir.
+#
+# Kullanıcı Ayarlar'dan kendi API anahtarını girdiyse bu kaynak ÖNCE denenir
+# (TEFAS'ı hiç yormadan); anahtar yoksa ya da bir kod burada bulunamazsa
+# fetch_tefas'a (doğrudan TEFAS) düşülür.
+FONOLOJI_BASE = "https://fonoloji.com/v1"
+
+
+def _fonoloji_gun_dizisi(tarih_metni: str) -> str:
+    """'2026-09-26' ya da '2026-09-26T00:00:00' -> '20260926'."""
+    return str(tarih_metni).replace("-", "")[:8]
+
+
+def fetch_fonoloji(codes: Iterable[str], api_key: str, *, timeout: int = 20,
+                   errors: list[str] | None = None,
+                   series_out: dict[str, dict[str, float]] | None = None
+                   ) -> dict[str, float]:
+    """
+    Fonoloji'nin `/funds/{kod}/timeseries` uç noktasından fon fiyat geçmişini
+    çeker. Tek bir istekte hem güncel fiyatı hem de ısı haritası için gereken
+    geçmiş seriyi aynı anda verdiği için fetch_tefas'taki `seriler` ile AYNI
+    biçimde ({kod: {tarih_metni: fiyat}}) döndürülür — compute_changes() bu
+    ikisini ayırt etmeden kullanabilir.
+
+    Fon başına ayrı istek atılır (toplu uç nokta belgelenmemiş); 21 fonluk bir
+    portföy günde 21 istekle ücretsiz aylık kotanın (15.000) çok altında kalır.
+
+    api_key boşsa hiç denenmez (kullanıcı henüz anahtar girmemiş demektir) —
+    bu bir hata değildir, çağıran fetch_tefas'a sessizce düşer.
+    """
+    codes = sorted({c.strip().upper() for c in codes if c and c.strip()})
+    if not codes or not api_key:
+        return {}
+
+    sonuc: dict[str, float] = {}
+    sorunlar: list[str] = []
+    seriler: dict[str, dict[str, float]] = {}
+    basliklar = {"X-API-Key": api_key}
+
+    for kod in codes:
+        try:
+            resp = requests.get(f"{FONOLOJI_BASE}/funds/{kod}/timeseries",
+                               params={"include": "nav"}, headers=basliklar,
+                               timeout=timeout)
+        except requests.RequestException as exc:
+            sorunlar.append(f"Fonoloji/{kod}: {type(exc).__name__}: "
+                            f"{str(exc)[:110]}")
+            continue
+
+        if resp.status_code == 401:
+            sorunlar.append("Fonoloji API anahtarı geçersiz ya da eksik "
+                            "(401) — Ayarlar'dan kontrol edin.")
+            break   # anahtar yanlışsa HİÇBİR kod için çalışmaz, boşuna denemeyin
+        if resp.status_code == 429:
+            bekle = resp.headers.get("retry-after", "")
+            sorunlar.append(
+                "Fonoloji kotası doldu (429)"
+                + (f" — {bekle} saniye sonra tekrar deneyin." if bekle else "."))
+            break   # kota dolduysa kalan kodlar için denemek anlamsız
+        if resp.status_code == 404:
+            sorunlar.append(f"Fonoloji bu fon kodunu tanımadı: {kod}")
+            continue
+        try:
+            resp.raise_for_status()
+        except requests.HTTPError as exc:
+            sorunlar.append(f"Fonoloji/{kod}: {type(exc).__name__}: "
+                            f"{str(exc)[:110]}")
+            continue
+
+        try:
+            veri = resp.json() or {}
+        except ValueError:
+            sorunlar.append(f"Fonoloji/{kod}: yanıt JSON değil")
+            continue
+
+        for nokta in (veri.get("points") or []):
+            if not isinstance(nokta, dict):
+                continue
+            fiyat, tarih = nokta.get("price"), nokta.get("date")
+            if fiyat is None or tarih is None:
+                continue
+            try:
+                fiyat = float(fiyat)
+            except (TypeError, ValueError):
+                continue
+            if fiyat <= 0:
+                continue
+            seriler.setdefault(kod, {})[_fonoloji_gun_dizisi(tarih)] = fiyat
+
+        if seriler.get(kod):
+            en_guncel_tarih = max(seriler[kod])
+            sonuc[kod] = seriler[kod][en_guncel_tarih]
+
+    if errors is not None and sorunlar:
+        errors.extend(sorunlar)
+    if series_out is not None:
+        series_out.update(seriler)
+    return sonuc
+
+
+# ---------------------------------------------------------------------------
 # ANA GİRİŞ NOKTASI
 # ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
@@ -1243,8 +1351,16 @@ def _metal_unit_price(usd_per_oz: float, unit: str | None, currency: str,
     return None
 
 
-def build_snapshot(assets: list[dict[str, Any]]) -> MarketSnapshot:
-    """Portföydeki her varlık için güncel fiyatı toplar."""
+def build_snapshot(assets: list[dict[str, Any]],
+                   fonoloji_api_key: str | None = None) -> MarketSnapshot:
+    """
+    Portföydeki her varlık için güncel fiyatı toplar.
+
+    fonoloji_api_key verilirse TEFAS fonları için ÖNCE Fonoloji denenir
+    (TEFAS'ın bulut IP'lerini engellemesinden etkilenmez); orada bulunamayan
+    kodlar için doğrudan TEFAS'a (fetch_tefas) düşülür. Anahtar yoksa davranış
+    eskisi gibi doğrudan TEFAS'tır.
+    """
     snap = MarketSnapshot(fetched_at=_now_istanbul())
 
     yahoo_tickers = {a["symbol"] for a in assets if a.get("source") == SRC_YAHOO}
@@ -1288,13 +1404,30 @@ def build_snapshot(assets: list[dict[str, Any]]) -> MarketSnapshot:
     tefas_errors: list[str] = []
     tefas_series: dict[str, dict[str, float]] = {}
     if tefas_codes:
-        try:
-            # 45 gün: 1 aylık değişim için yeterli geçmiş kalsın.
-            tefas_prices = fetch_tefas(tefas_codes, lookback_days=45,
+        kalan_kodlar = set(tefas_codes)
+        if fonoloji_api_key:
+            try:
+                fonoloji_prices = fetch_fonoloji(
+                    kalan_kodlar, fonoloji_api_key,
+                    errors=tefas_errors, series_out=tefas_series)
+            except Exception as exc:                       # noqa: BLE001
+                fonoloji_prices = {}
+                tefas_errors.append(f"Fonoloji'ye ulaşılamadı: {exc}")
+            tefas_prices.update(fonoloji_prices)
+            kalan_kodlar -= set(fonoloji_prices)
+            if fonoloji_prices:
+                log.info("Fonoloji %d/%d fonu çözdü, TEFAS'a kalan: %s",
+                         len(fonoloji_prices), len(tefas_codes),
+                         sorted(kalan_kodlar) or "yok")
+        if kalan_kodlar:
+            try:
+                # 45 gün: 1 aylık değişim için yeterli geçmiş kalsın.
+                dogrudan = fetch_tefas(kalan_kodlar, lookback_days=45,
                                        errors=tefas_errors,
                                        series_out=tefas_series)
-        except Exception as exc:
-            snap.errors.append(f"TEFAS'a ulaşılamadı: {exc}")
+                tefas_prices.update(dogrudan)
+            except Exception as exc:
+                snap.errors.append(f"TEFAS'a ulaşılamadı: {exc}")
         # Sadece değeri fiyata BAĞLI olan satırlar için uyar; kova satırlarının
         # değeri elle girilen tutardan gelir, fiyat bilgisi orada sadece yardımcıdır.
         critical = {a["symbol"].upper() for a in assets
@@ -3552,6 +3685,22 @@ class _Namespace:
             raise AttributeError(name) from exc
 
 
+an = px = _Namespace()
+
+
+
+# --- Modül kısayolları -------------------------------------------------------
+# Modüler sürümde `an` = analytics, `px` = prices modülüydü. Tek dosyada hepsi
+# aynı isim alanında olduğundan ikisini de bu dosyanın global alanına bağlıyoruz.
+# (sys.modules kullanılmıyor: Streamlit betiği kendi isim alanında çalıştırır.)
+class _Namespace:
+    def __getattr__(self, name):
+        try:
+            return globals()[name]
+        except KeyError as exc:
+            raise AttributeError(name) from exc
+
+
 an = hist = imp = ins = px = _Namespace()
 
 
@@ -3909,7 +4058,8 @@ def get_history_store() -> Storage:
 
 
 @st.cache_resource(ttl=300, show_spinner=False)
-def cached_snapshot(fingerprint: str, _assets: list[dict]) -> px.MarketSnapshot:
+def cached_snapshot(fingerprint: str, _assets: list[dict],
+                    fonoloji_api_key: str = "") -> px.MarketSnapshot:
     """
     Piyasa anlık görüntüsünü önbellekler.
 
@@ -3923,16 +4073,33 @@ def cached_snapshot(fingerprint: str, _assets: list[dict]) -> px.MarketSnapshot:
       cache_resource nesneyi olduğu gibi saklar, serileştirmez.
 
     `_assets` alt çizgiyle başlıyor: Streamlit bu parametreyi
-    ANAHTARLAMADA KULLANMAZ. Önbellek anahtarı fingerprint'tir; fiyatlar
-    yalnızca sembol/kaynak/birim üçlüsüne bağlı olduğu için adet veya
-    maliyet değişince fiyatları yeniden çekmek gereksizdir.
+    ANAHTARLAMADA KULLANMAZ. Önbellek anahtarı fingerprint + fonoloji_api_key
+    kombinasyonudur; fiyatlar yalnızca sembol/kaynak/birim üçlüsüne bağlı
+    olduğu için adet veya maliyet değişince fiyatları yeniden çekmek
+    gereksizdir — ama anahtar eklenir/değişirse (fonoloji_api_key alt çizgisiz,
+    yani anahtarlamaya DAHİL) önbellek otomatik tazelenir.
     """
-    return px.build_snapshot(_assets)
+    return px.build_snapshot(_assets, fonoloji_api_key=fonoloji_api_key or None)
 
 
 def snapshot_fingerprint(assets: list[dict]) -> str:
     return "|".join(sorted(f"{a['symbol']}:{a.get('source')}:{a.get('unit')}"
                            for a in assets))
+
+
+def fonoloji_api_key() -> str:
+    """
+    Ayarlar'da (secrets.toml'daki [fonoloji] bölümünde) girilen API anahtarını
+    okur. Yoksa boş döner — bu bir hata değildir, TEFAS fonları o zaman
+    doğrudan tefas.gov.tr'den (fetch_tefas) çekilir.
+    """
+    try:
+        secrets = getattr(st, "secrets", None)
+        if secrets is not None and "fonoloji" in secrets:
+            return str(secrets["fonoloji"].get("api_key", "")).strip()
+    except Exception:
+        pass
+    return ""
 
 
 def fmt_try(v: float) -> str:
@@ -3974,7 +4141,8 @@ with st.spinner("Piyasa verisi çekiliyor…"):
     else:
         # Önbellek bir HIZLANDIRMADIR; bozulursa uygulamayı düşürmemeli.
         try:
-            snap = cached_snapshot(snapshot_fingerprint(assets), assets)
+            snap = cached_snapshot(snapshot_fingerprint(assets), assets,
+                                   fonoloji_api_key())
         except Exception as exc:                          # noqa: BLE001
             st.caption(f"ℹ️ Fiyat önbelleği devre dışı ({type(exc).__name__}); "
                        f"veriler doğrudan çekiliyor.")
@@ -5245,6 +5413,29 @@ with tab_ayar:
                         st.markdown(
                             "Dosya başka bir yerden değiştirilmiş. Sayfayı "
                             "yenileyip tekrar deneyin.")
+
+    section("TEFAS fon fiyatları")
+    _fkey = fonoloji_api_key()
+    if _fkey:
+        st.success(
+            "Fonoloji API anahtarı tanımlı — TEFAS fonları önce Fonoloji "
+            "üzerinden denenir, orada bulunamayan kodlar için doğrudan "
+            "TEFAS'a düşülür.")
+    else:
+        st.info(
+            "Fonoloji API anahtarı girilmemiş — TEFAS fonları doğrudan "
+            "tefas.gov.tr'den çekiliyor. TEFAS'ın bulut sunucuları (Streamlit "
+            "Cloud dahil) WAF ile engellediği, '429 Too Many Requests' "
+            "hatası aldığınız durumlarda şu adımları izleyin:\n\n"
+            "1. **fonoloji.com/panel/api** adresinden ücretsiz bir API "
+            "anahtarı alın (kredi kartı istemez, 1 dakikada).\n"
+            "2. Streamlit **Settings → Secrets**'a şunu ekleyin:\n\n"
+            "```toml\n[fonoloji]\napi_key = \"...\"\n```\n\n"
+            "3. Uygulamayı yeniden başlatın (**Reboot app**).\n\n"
+            "Not: Fonoloji, TEFAS'ın herkese açık verisini kendi "
+            "altyapısından toplayan üçüncü taraf bir servistir — resmî TEFAS "
+            "değildir, veriler birebir aynı anda güncellenmeyebilir. Anahtar "
+            "girilmezse hiçbir şey bozulmaz, davranış eskisiyle aynı kalır.")
 
     section("Fiyat kaynağı durumu")
     if not df.empty:

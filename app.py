@@ -14,8 +14,8 @@ from __future__ import annotations
 # Derleyici üretir. Amacı tek bir soruyu kesin cevaplamak: "yüklediğim dosya
 # gerçekten çalışıyor mu?" Uygulama bunu başlıkta ve Ayarlar'da gösterir;
 # yüklediğiniz dosyanınkiyle aynı değilse yayındaki sürüm eski demektir.
-BUILD_ID = "c8850766bb"
-BUILD_TIME = "2026-10-02 11:23"
+BUILD_ID = "01ae09b581"
+BUILD_TIME = "2026-10-02 12:04"
 
 
 # ==========================================================================
@@ -4301,9 +4301,103 @@ if not df.empty and not df["Değer (TRY)"].isna().all():
 # ============================== DAĞILIM ====================================
 PERIOD_DAYS = {lbl: d for lbl, d in hist.PERIODS}
 
+# "Dönem" radyo düğmesindeki etiketler (hist.PERIODS) ile varlık bazlı canlı
+# değişim sütunlarını (an.CHANGE_LABELS, snap.changes'ten gelir) eşler.
+# "Başlangıçtan" için karşılığı yok: canlı değişim verisi en çok 1 yıl geriye
+# gider, bu yüzden o seçimde varlık kırılımı gösterilemez.
+CHANGE_LABEL_BY_PERIOD = {
+    "Günlük": "1G %", "Haftalık": "1H %", "Aylık": "1A %",
+    "3 Aylık": "3A %", "6 Aylık": "6A %", "Yıllık": "1Y %",
+}
+
+
+def render_varlik_bazinda_degisim(secim: str) -> None:
+    """
+    "Hangi varlık ne kadar arttı/azaldı" sorusunu doğrudan cevaplayan bölüm.
+
+    Üstteki toplam-seri grafiği ve ısı haritası iyi bir genel görünüm verir
+    ama TEK TEK varlıkları sıralayıp karşılaştırmak için elverişli değildir.
+    Burada seçili döneme göre en çok artan/azalan varlıklar ayrı listelenir,
+    tam tablo ise isteyene açılır.
+    """
+    section("Varlık bazında değişim")
+    anahtar_sutun = CHANGE_LABEL_BY_PERIOD.get(secim)
+    if anahtar_sutun is None:
+        st.caption(
+            f"'{secim}' dönemi yalnızca yukarıdaki toplam seride gösterilir — "
+            "varlık bazında kırılım için Günlük, Haftalık, Aylık, 3 Aylık, "
+            "6 Aylık ya da Yıllık seçin.")
+        return
+    if df.empty or anahtar_sutun not in df.columns:
+        return
+
+    sub = df[df[anahtar_sutun].notna() & df["Fiyat OK"]].copy()
+    if sub.empty:
+        st.caption("Bu dönem için hiçbir varlıkta yüzde değişim verisi yok.")
+        return
+
+    sub["_degisim_tutar"] = (sub[anahtar_sutun] / 100.0 * sub["Değer (TRY)"]
+                            * GOSTER_ORAN)
+    n_artan = int((sub[anahtar_sutun] > 0).sum())
+    n_azalan = int((sub[anahtar_sutun] < 0).sum())
+    st.caption(f"{secim.lower()} dönemde **{n_artan} varlık arttı, "
+               f"{n_azalan} varlık azaldı** ({len(sub)} varlık fiyat "
+               f"verisiyle karşılaştırıldı, geri kalanı canlı fiyatlanmıyor "
+               f"ya da bu dönem için veri yok).")
+
+    def _mini_tablo(frame: pd.DataFrame) -> pd.DataFrame:
+        return pd.DataFrame({
+            "Varlık": frame["Etiket"],
+            "Sınıf": frame["Ana Sınıf"],
+            "Değişim %": frame[anahtar_sutun],
+            f"Değişim ({GOSTER})": frame["_degisim_tutar"],
+        })
+
+    kazananlar = sub[sub[anahtar_sutun] > 0].sort_values(
+        anahtar_sutun, ascending=False).head(8)
+    kaybedenler = sub[sub[anahtar_sutun] < 0].sort_values(
+        anahtar_sutun, ascending=True).head(8)
+
+    mini_cfg = {
+        "Değişim %": st.column_config.NumberColumn(format="%+.2f%%"),
+        f"Değişim ({GOSTER})": st.column_config.NumberColumn(format="%+,.0f"),
+    }
+    col_art, col_azal = st.columns(2)
+    with col_art:
+        st.markdown("🟢 **En çok artanlar**")
+        if kazananlar.empty:
+            st.caption("Bu dönemde artan varlık yok.")
+        else:
+            st.dataframe(_mini_tablo(kazananlar), width="stretch",
+                        hide_index=True, column_config=mini_cfg)
+    with col_azal:
+        st.markdown("🔴 **En çok azalanlar**")
+        if kaybedenler.empty:
+            st.caption("Bu dönemde azalan varlık yok.")
+        else:
+            st.dataframe(_mini_tablo(kaybedenler), width="stretch",
+                        hide_index=True, column_config=mini_cfg)
+
+    with st.expander(f"Tüm varlıklar — {secim.lower()} değişim ({len(sub)} varlık)"):
+        tum = sub.sort_values(anahtar_sutun, ascending=False)
+        tum_tablo = pd.DataFrame({
+            "Varlık": tum["Etiket"],
+            "Sınıf": tum["Ana Sınıf"],
+            "Ağırlık %": tum["Ağırlık %"],
+            "Değişim %": tum[anahtar_sutun],
+            f"Değer ({GOSTER})": tum["Değer (TRY)"] * GOSTER_ORAN,
+            f"Değişim ({GOSTER})": tum["_degisim_tutar"],
+        })
+        st.dataframe(tum_tablo, width="stretch", hide_index=True, column_config={
+            "Ağırlık %": st.column_config.NumberColumn(format="%.1f%%"),
+            "Değişim %": st.column_config.NumberColumn(format="%+.2f%%"),
+            f"Değer ({GOSTER})": st.column_config.NumberColumn(format="%,.0f"),
+            f"Değişim ({GOSTER})": st.column_config.NumberColumn(format="%+,.0f"),
+        })
+
 
 def render_degisim(history: list[dict]) -> None:
-    """Ana sayfadaki varlık değişimi bölümü: grafik + dönem dökümü."""
+    """Ana sayfadaki varlık değişimi bölümü: grafik + varlık kırılımı + dönem dökümü."""
     section("Varlık değişimi")
 
     if len(history) < 2:
@@ -4368,6 +4462,8 @@ def render_degisim(history: list[dict]) -> None:
         hovermode="x unified", **CHART_LAYOUT)
     st.plotly_chart(fig, width="stretch")
 
+    render_varlik_bazinda_degisim(secim)
+
     # --- Dönem dökümü ---
     if not changes:
         st.caption("Dönem karşılaştırması için henüz yeterli geçmiş yok.")
@@ -4387,9 +4483,9 @@ def render_degisim(history: list[dict]) -> None:
     st.dataframe(
         dokum, width="stretch", hide_index=True,
         column_config={
-            "Başlangıç Değeri": st.column_config.NumberColumn(format="%.0f"),
-            "Güncel Değer": st.column_config.NumberColumn(format="%.0f"),
-            f"Değişim ({GOSTER})": st.column_config.NumberColumn(format="%+.0f"),
+            "Başlangıç Değeri": st.column_config.NumberColumn(format="%,.0f"),
+            "Güncel Değer": st.column_config.NumberColumn(format="%,.0f"),
+            f"Değişim ({GOSTER})": st.column_config.NumberColumn(format="%+,.0f"),
             "Değişim %": st.column_config.NumberColumn(format="%+.2f%%"),
         })
     st.caption(
@@ -4554,7 +4650,7 @@ with tab_dag:
                              width="stretch",
                              hide_index=True,
                              column_config={f"Değer ({GOSTER})": st.column_config.NumberColumn(
-                                 format="%.0f"),
+                                 format="%,.0f"),
                                  "Pay %": st.column_config.NumberColumn(format="%.2f%%")})
 
 # ============================== POZİSYONLAR =================================
@@ -4604,11 +4700,11 @@ with tab_poz:
             "Ağırlık %": st.column_config.ProgressColumn(
                 format="%.2f%%", min_value=0.0,
                 max_value=float(_t["Ağırlık %"].max(skipna=True) or 100)),
-            "Adet": st.column_config.NumberColumn(format="%.4f"),
-            "Ort. Maliyet": st.column_config.NumberColumn(format="%.4f"),
-            "Güncel Fiyat": st.column_config.NumberColumn(format="%.4f"),
-            f"Değer ({GOSTER})": st.column_config.NumberColumn(format="%.0f"),
-            f"K/Z ({GOSTER})": st.column_config.NumberColumn(format="%+.0f"),
+            "Adet": st.column_config.NumberColumn(format="%,.4f"),
+            "Ort. Maliyet": st.column_config.NumberColumn(format="%,.4f"),
+            "Güncel Fiyat": st.column_config.NumberColumn(format="%,.4f"),
+            f"Değer ({GOSTER})": st.column_config.NumberColumn(format="%,.0f"),
+            f"K/Z ({GOSTER})": st.column_config.NumberColumn(format="%+,.0f"),
             "Toplam %": st.column_config.NumberColumn(format="%+.2f%%"),
         }
         for _d in _mevcut_don:
@@ -4789,7 +4885,7 @@ with tab_analiz:
                         "Hedef %": st.column_config.NumberColumn(format="%.2f%%"),
                         "Fark puan": st.column_config.NumberColumn(format="%+.2f"),
                         f"Fark ({GOSTER})": st.column_config.NumberColumn(
-                            format="%+.0f")})
+                            format="%+,.0f")})
                 _top = float(_denge["Hedef %"].sum())
                 if abs(_top - 100.0) > 0.5:
                     st.caption(f"Girdiğiniz hedeflerin toplamı %{_top:,.1f} "
@@ -4936,13 +5032,13 @@ with tab_hisse:
                     width="stretch", hide_index=True,
                     column_config={
                         "Ağırlık %": st.column_config.NumberColumn(format="%.2f%%"),
-                        "Fiyat": st.column_config.NumberColumn(format="$%.2f"),
-                        "Hedef": st.column_config.NumberColumn(format="$%.2f"),
+                        "Fiyat": st.column_config.NumberColumn(format="$%,.2f"),
+                        "Hedef": st.column_config.NumberColumn(format="$%,.2f"),
                         "Potansiyel %": st.column_config.NumberColumn(format="%+.1f%%"),
                         "Kâr büyüme %": st.column_config.NumberColumn(format="%+.1f%%"),
                         "Gelir büyüme %": st.column_config.NumberColumn(format="%+.1f%%"),
-                        "F/K": st.column_config.NumberColumn(format="%.1f"),
-                        "İleri F/K": st.column_config.NumberColumn(format="%.1f"),
+                        "F/K": st.column_config.NumberColumn(format="%,.1f"),
+                        "İleri F/K": st.column_config.NumberColumn(format="%,.1f"),
                     })
 
                 section("Sektör dağılımı (analist verisine göre)")
@@ -5002,9 +5098,9 @@ with tab_duzen:
             "Birim": st.column_config.SelectboxColumn(
                 options=UNIT_OPTIONS, width="small",
                 help="Sadece altın/gümüş için; diğerlerinde 'Yok'"),
-            "Adet": st.column_config.NumberColumn(format="%.4f", min_value=0.0),
+            "Adet": st.column_config.NumberColumn(format="%,.4f", min_value=0.0),
             "Birim Maliyet": st.column_config.NumberColumn(
-                format="%.4f", min_value=0.0,
+                format="%,.4f", min_value=0.0,
                 help="Canlı modda birim maliyet, kova modunda toplam maliyet"),
             "Maliyet Para Birimi": st.column_config.SelectboxColumn(
                 options=CURRENCIES, width="small", required=True,
@@ -5012,7 +5108,7 @@ with tab_duzen:
                      "hissesinin fiyatı TRY iken maliyeti USD olabilir. "
                      "Çevrim her açılışta güncel kurla yapılır."),
             "Son Değer": st.column_config.NumberColumn(
-                format="%.2f", min_value=0.0,
+                format="%,.2f", min_value=0.0,
                 help="Adet girilmediğinde kullanılan güncel toplam tutar"),
             "Notlar": st.column_config.TextColumn(width="medium"),
         },
@@ -5044,10 +5140,10 @@ with tab_duzen:
         st.dataframe(
             view, width="stretch", hide_index=True,
             column_config={
-                "Adet": st.column_config.NumberColumn(format="%.4f"),
-                "Fiyat": st.column_config.NumberColumn(format="%.4f"),
+                "Adet": st.column_config.NumberColumn(format="%,.4f"),
+                "Fiyat": st.column_config.NumberColumn(format="%,.4f"),
                 "K/Z %": st.column_config.NumberColumn(format="%.2f%%"),
-                f"Değer ({GOSTER})": st.column_config.NumberColumn(format="%.0f"),
+                f"Değer ({GOSTER})": st.column_config.NumberColumn(format="%,.0f"),
                 "Ağırlık %": st.column_config.ProgressColumn(
                     format="%.1f%%", min_value=0.0,
                     max_value=float(df["Ağırlık %"].max(skipna=True) or 100)),
@@ -5093,12 +5189,12 @@ with tab_kova:
                       "Para Birimi", "_key"],
             column_config={
                 "_key": None,
-                "Canlı Birim Fiyat": st.column_config.NumberColumn(format="%.4f"),
+                "Canlı Birim Fiyat": st.column_config.NumberColumn(format="%,.4f"),
                 "Güncel Değer": st.column_config.NumberColumn(
-                    format="%.2f", min_value=0.0),
+                    format="%,.2f", min_value=0.0),
                 "Toplam Maliyet": st.column_config.NumberColumn(
-                    format="%.2f", min_value=0.0),
-                "Adet": st.column_config.NumberColumn(format="%.4f", min_value=0.0),
+                    format="%,.2f", min_value=0.0),
+                "Adet": st.column_config.NumberColumn(format="%,.4f", min_value=0.0),
             },
             key="kova_editor")
 
@@ -5450,7 +5546,7 @@ with tab_ayar:
                    "Fiyat OK", "Hata"]]
         st.dataframe(diag, width="stretch", hide_index=True,
                      column_config={"Fiyat": st.column_config.NumberColumn(
-                         format="%.4f")})
+                         format="%,.4f")})
 
     section("Yedek")
     y1, y2 = st.columns(2)

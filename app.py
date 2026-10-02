@@ -14,8 +14,8 @@ from __future__ import annotations
 # Derleyici üretir. Amacı tek bir soruyu kesin cevaplamak: "yüklediğim dosya
 # gerçekten çalışıyor mu?" Uygulama bunu başlıkta ve Ayarlar'da gösterir;
 # yüklediğiniz dosyanınkiyle aynı değilse yayındaki sürüm eski demektir.
-BUILD_ID = "118d730c96"
-BUILD_TIME = "2026-10-02 07:15"
+BUILD_ID = "c8850766bb"
+BUILD_TIME = "2026-10-02 11:23"
 
 
 # ==========================================================================
@@ -1044,7 +1044,14 @@ def fetch_fonoloji(codes: Iterable[str], api_key: str, *, timeout: int = 20,
             sorunlar.append(f"Fonoloji/{kod}: yanıt JSON değil")
             continue
 
-        for nokta in (veri.get("points") or []):
+        # Noktalar üst seviyede DEĞİL — include=nav istendiği için "nav" adlı
+        # bir alt nesnenin içinde geliyor: {"code":..., "nav": {"points":[...]}}.
+        # Üst seviyede "points" aramak sessizce boş dönüyordu (hiç hata
+        # vermeden!) — bu yüzden Fonoloji hiçbir fonu çözemiyor, hepsi fark
+        # edilmeden doğrudan TEFAS'a düşüyordu. Yine de ileride API şekli
+        # değişirse diye üst seviyeyi de yedek olarak deniyoruz.
+        noktalar = (veri.get("nav") or {}).get("points") or veri.get("points") or []
+        for nokta in noktalar:
             if not isinstance(nokta, dict):
                 continue
             fiyat, tarih = nokta.get("price"), nokta.get("date")

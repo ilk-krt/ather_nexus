@@ -14,8 +14,8 @@ from __future__ import annotations
 # Derleyici üretir. Amacı tek bir soruyu kesin cevaplamak: "yüklediğim dosya
 # gerçekten çalışıyor mu?" Uygulama bunu başlıkta ve Ayarlar'da gösterir;
 # yüklediğiniz dosyanınkiyle aynı değilse yayındaki sürüm eski demektir.
-BUILD_ID = "01ae09b581"
-BUILD_TIME = "2026-10-02 12:04"
+BUILD_ID = "2b52d247e6"
+BUILD_TIME = "2026-10-02 12:40"
 
 
 # ==========================================================================
@@ -85,6 +85,7 @@ METAL_UNITS = {
     "RESAT": 7.0160,
     "BILEZIK22": 0.916,    # 1 gram 22 ayar bilezik
     "BILEZIK14": 0.585,
+    "ALTINS1": 0.01,        # Darphane Altın.S1 sertifikası: 1 adet = 0,01 g saf altın
 }
 
 # --------------------------------------------------------------------------
@@ -176,6 +177,21 @@ _reg("LINK UNI AAVE", source=SRC_YAHOO, currency="USD",
 _reg("USDT USDC", source=SRC_YAHOO, currency="USD",
      ana="Nakit", alt="Stablecoin", sektor="Dolar Stablecoin", suffix="-USD")
 
+# Yahoo'da düz "<KOD>-USD" sembolünü başka (genelde önemsiz/küçük hacimli) bir
+# coin kapmış olabiliyor; gerçek varlık o zaman Yahoo'da sayısal bir ID ekiyle
+# ayrıştırılıyor. "SUI" ve "EDU" için bu durum canlıda doğrulandı — düz
+# SUI-USD "Salmonation", düz EDU-USD "EduCoin" dönüyordu, gerçek Sui/Open
+# Campus fiyatı hiç çekilemiyordu. Üstteki toplu kayıtlardan SONRA buraya
+# yazıldığı için aynı anahtarı (SUI) burada EZER.
+SMART_DATABASE["SUI"] = {
+    "source": SRC_YAHOO, "currency": "USD", "ana_sinif": "Kripto",
+    "alt_sinif": "Altcoin", "sektor": "L1 Zincir", "yahoo_suffix": "20947-USD",
+}
+SMART_DATABASE["EDU"] = {
+    "source": SRC_YAHOO, "currency": "USD", "ana_sinif": "Kripto",
+    "alt_sinif": "Altcoin", "sektor": "Diğer Kripto", "yahoo_suffix": "24613-USD",
+}
+
 # --- Emtia (türetilmiş) -----------------------------------------------------
 SMART_DATABASE["ALTIN"] = {
     "source": SRC_GOLD, "currency": "TRY", "ana_sinif": "Emtia",
@@ -194,6 +210,15 @@ for _u in ("CEYREK", "YARIM", "TAM", "CUMHURIYET", "ATA", "RESAT",
 SMART_DATABASE["GUMUS-ONS"] = {
     "source": SRC_SILVER, "currency": "USD", "ana_sinif": "Emtia",
     "alt_sinif": "Kıymetli Maden", "sektor": "Gümüş", "unit": "ONS",
+}
+# Darphane Altın.S1 sertifikası: BIST'te işlem görür ama Yahoo Finance bu
+# ürünü hiç listelemiyor (Yahoo'da yalnızca hisse/ETF türü BIST enstrümanları
+# var). Gerçek market fiyatı yerine, sertifikanın karşılığı olan saf altın
+# miktarı üzerinden (gram altın × 0,01) türetiyoruz — diğer fiziki altın
+# formları (çeyrek, yarım, tam…) zaten aynı yöntemle fiyatlanıyor.
+SMART_DATABASE["ALTIN.S1"] = {
+    "source": SRC_GOLD, "currency": "TRY", "ana_sinif": "Emtia",
+    "alt_sinif": "Altın", "sektor": "Altın Sertifikası", "unit": "ALTINS1",
 }
 
 # --- Nakit ------------------------------------------------------------------

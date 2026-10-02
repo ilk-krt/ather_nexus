@@ -1549,12 +1549,12 @@
   {
     "symbol": "ALTIN.S1.IS",
     "display": "ALTIN.S1",
-    "source": "yahoo",
+    "source": "gold",
     "currency": "TRY",
     "ana_sinif": "Emtia",
     "alt_sinif": "Altın",
     "sektor": "Altın Sertifikası",
-    "unit": null,
+    "unit": "ALTINS1",
     "qty": 1843.0,
     "avg_cost": 61.51,
     "cost_currency": "TRY",
@@ -1689,7 +1689,7 @@
     "alt_sinif": "Altcoin",
     "sektor": "L1 Zincir",
     "display": "SUI",
-    "symbol": "SUI-USD",
+    "symbol": "SUI20947-USD",
     "unit": null,
     "qty": 2378.1426,
     "avg_cost": 1.19,
@@ -1785,7 +1785,7 @@
     "valuation": "qty"
   },
   {
-    "symbol": "EDU-USD",
+    "symbol": "EDU24613-USD",
     "display": "EDU",
     "source": "yahoo",
     "currency": "USD",

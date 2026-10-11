@@ -14,8 +14,8 @@ from __future__ import annotations
 # Derleyici üretir. Amacı tek bir soruyu kesin cevaplamak: "yüklediğim dosya
 # gerçekten çalışıyor mu?" Uygulama bunu başlıkta ve Ayarlar'da gösterir;
 # yüklediğiniz dosyanınkiyle aynı değilse yayındaki sürüm eski demektir.
-BUILD_ID = "b427de16e9"
-BUILD_TIME = "2026-10-11 20:16"
+BUILD_ID = "487f739f1d"
+BUILD_TIME = "2026-10-11 20:29"
 
 
 # ==========================================================================
@@ -3779,6 +3779,7 @@ st.markdown(
       --accent:    #00e5ff;
       --pos:       #2fbe86;
       --neg:       #f0736f;
+      --pct:       #e0ac3f;
     }
 
     .stApp { background: var(--bg); color: var(--ink); }
@@ -3878,9 +3879,11 @@ st.markdown(
       color: var(--ink-3); margin-bottom: .1rem;
     }
     .pf-chg .amt { font-weight: 600; font-size: .8rem; color: var(--ink-2); }
-    .pf-chg .pct { font-size: .72rem; color: var(--ink-3); }
-    .pf-chg.pos .amt, .pf-chg.pos .pct { color: var(--pos); }
-    .pf-chg.neg .amt, .pf-chg.neg .pct { color: var(--neg); }
+    /* Yüzdeler, tutarlardan (yön = yeşil/kırmızı) görsel olarak ayrışsın diye
+       her zaman sarı — artış/azalış farketmeksizin. */
+    .pf-chg .pct { font-size: .72rem; color: var(--pct); }
+    .pf-chg.pos .amt { color: var(--pos); }
+    .pf-chg.neg .amt { color: var(--neg); }
     .pf-children { padding-bottom: .25rem; }
     @media (max-width: 640px) {
       .pf-row { gap: .35rem; padding: .62rem .55rem; }
@@ -4062,6 +4065,10 @@ st.markdown(
     .kpi-value { color: var(--ink) !important; }
     .kpi-value.pos, .kpi-sub.pos, .badge.pos { color: var(--pos) !important; }
     .kpi-value.neg, .kpi-sub.neg, .badge.neg { color: var(--neg) !important; }
+    .pf-chg.pos .amt { color: var(--pos) !important; }
+    .pf-chg.neg .amt { color: var(--neg) !important; }
+    .pf-chg .pct { color: var(--pct) !important; }
+    .pf-chg .lbl, .pf-value .c, .pf-name .pf-count, .pf-caret { color: var(--ink-3) !important; }
     .nx-brand .tag { color: var(--bg) !important; }
     a, a:visited, a * { color: var(--accent) !important; }
     .stTabs [aria-selected="true"], .stTabs [aria-selected="true"] * {
@@ -4107,38 +4114,55 @@ def kpi(label: str, value: str, sub: str = "", tone: str = "") -> str:
             f"<div class='kpi-sub{cls}'>{sub}</div></div>")
 
 
-def _pf_chg_html(etiket: str, tutar: float, pct: float) -> str:
+def _pf_para(v: float, cur: str) -> str:
+    """fmt_try() ile aynı iş ama GLOBAL para birimi (GOSTER) yerine
+    VERİLEN para biriminde biçimlendirir — bir portföy özeti grubu, genel
+    seçiciden bağımsız olarak kendi doğal para biriminde (ör. dolar)
+    gösterilebilsin diye."""
+    return an.format_money(v, cur, globals().get("_fx_now") or {})
+
+
+def _pf_chg_html(etiket: str, tutar: float, pct: float, cur: str) -> str:
     """Portföy özeti satırlarındaki tek bir değişim hücresi (Günlük/Toplam).
 
     Tutar NaN ise (ör. hiç fiyat verisi olmayan grup) renksiz '—' gösterir;
-    aksi halde işaret + renk (yeşil/kırmızı) otomatik belirlenir.
+    aksi halde tutar yöne göre (yeşil/kırmızı) renklenir. Yüzde her zaman
+    sarı — tutardan görsel olarak ayrışsın diye, artış/azalış farketmeksizin.
+
+    `cur` dönüşümü için kur gerekebilir (ör. TRY tutarı USD'ye çevirirken);
+    kur o an çekilemediyse format_money "—" döner — bu durumda "+—" gibi
+    anlamsız bir işaretli tire göstermemek için işareti/rengi de düşürüyoruz.
     """
     if tutar != tutar:  # NaN
+        return (f'<div class="pf-chg"><div class="lbl">{html.escape(etiket)}</div>'
+                f'<div class="amt">—</div></div>')
+    metin = _pf_para(tutar, cur)
+    if metin == "—":
         return (f'<div class="pf-chg"><div class="lbl">{html.escape(etiket)}</div>'
                 f'<div class="amt">—</div></div>')
     yon = "pos" if tutar >= 0 else "neg"
     isaret = "+" if tutar >= 0 else ""
     pct_metin = f"{pct:+.2f}%" if pct == pct else "—"
     return (f'<div class="pf-chg {yon}"><div class="lbl">{html.escape(etiket)}</div>'
-            f'<div class="amt">{isaret}{fmt_try(tutar)}</div>'
+            f'<div class="amt">{isaret}{metin}</div>'
             f'<div class="pct">{pct_metin}</div></div>')
 
 
 def _pf_row_html(ad: str, deger: float, maliyet: float,
                  gunluk_tutar: float, gunluk_pct: float,
-                 toplam_tutar: float, toplam_pct: float,
+                 toplam_tutar: float, toplam_pct: float, cur: str,
                  n: int | None = None, caret: bool = False) -> str:
     sayac = f'<span class="pf-count">· {n} varlık</span>' if n else ""
     oklu_ad = (f'<span class="pf-caret">▸</span>{html.escape(ad)}' if caret
                else html.escape(ad))
-    maliyet_html = (f'<div class="c">maliyet {fmt_try(maliyet)}</div>'
+    maliyet_html = (f'<div class="c">maliyet {_pf_para(maliyet, cur)}</div>'
                     if maliyet and maliyet > 0 else "")
     return (
         f'<div class="pf-row">'
         f'<div class="pf-name">{oklu_ad}{sayac}</div>'
-        f'<div class="pf-value"><div class="v">{fmt_try(deger)}</div>{maliyet_html}</div>'
-        f'{_pf_chg_html("Günlük", gunluk_tutar, gunluk_pct)}'
-        f'{_pf_chg_html("Toplam", toplam_tutar, toplam_pct)}'
+        f'<div class="pf-value"><div class="v">{_pf_para(deger, cur)}</div>{maliyet_html}</div>'
+        f'{_pf_chg_html("Günlük", gunluk_tutar, gunluk_pct, cur)}'
+        f'{_pf_chg_html("Toplam", toplam_tutar, toplam_pct, cur)}'
         f'</div>')
 
 
@@ -4819,6 +4843,34 @@ def _pf_grup_ozet(alt: pd.DataFrame) -> dict[str, float]:
                gunluk_tutar=gunluk_tutar, gunluk_pct=gunluk_pct)
 
 
+# Bu gruplar doğaları gereği dolar bazlı (ABD hisseleri, kripto) — genel
+# para birimi seçicisi (üstteki TRY/USD/EUR) ne olursa olsun Portföy
+# özeti'nde varsayılan olarak dolar gösterilirler. Kullanıcı isterse genel
+# seçiciyi USD yaparak zaten her şeyi dolara çevirebilir; bu SADECE kendi
+# grupları için sabit varsayılan (örn. BIST hâlâ TL kalır).
+PF_USD_GRUPLAR = {"ABD", "Kripto"}
+
+
+def _pf_para_birimi(grup_adi: str, alt: pd.DataFrame) -> str:
+    """
+    Bir grubun gösterim para birimi.
+
+    Önce adından biliniyorsa (ABD hisseleri, kripto) doğrudan USD döner.
+    Diğer her grupta (Sabit Getirili gibi karma gruplar dahil) varlıkların
+    DEĞERE göre ağırlıklı çoğunluğu USD ise yine USD, aksi halde genel
+    seçici (GOSTER) kullanılır — ör. Nakit grubunda çoğunlukla TL varsa
+    TL kalır, Sabit Getirili'de eurobond ağır basıyorsa dolar olur.
+    """
+    if grup_adi in PF_USD_GRUPLAR:
+        return "USD"
+    toplam = float(alt["Değer (TRY)"].sum(skipna=True))
+    if toplam > 0:
+        usd_deger = float(alt.loc[alt["Para Birimi"] == "USD", "Değer (TRY)"].sum(skipna=True))
+        if usd_deger / toplam >= 0.5:
+            return "USD"
+    return GOSTER
+
+
 def render_portfoy_ozeti(df: pd.DataFrame) -> None:
     """
     "Portföy özeti" — gruplanmış, katlanır varlık görünümü.
@@ -4843,9 +4895,11 @@ def render_portfoy_ozeti(df: pd.DataFrame) -> None:
     parcalar: list[str] = []
     for g in grup_sirasi:
         alt = calisma[calisma["_grup"] == g]
+        cur = _pf_para_birimi(g, alt)
         oz = _pf_grup_ozet(alt)
-        baslik = _pf_row_html(g, oz["deger"], oz["maliyet"], oz["gunluk_tutar"],
-                              oz["gunluk_pct"], oz["kz"], oz["kz_pct"],
+        ad_etiket = f"{g} ($)" if cur == "USD" and cur != GOSTER else g
+        baslik = _pf_row_html(ad_etiket, oz["deger"], oz["maliyet"], oz["gunluk_tutar"],
+                              oz["gunluk_pct"], oz["kz"], oz["kz_pct"], cur,
                               n=len(alt), caret=True)
 
         cocuklar: list[str] = []
@@ -4854,7 +4908,7 @@ def render_portfoy_ozeti(df: pd.DataFrame) -> None:
             cocuklar.append(_pf_row_html(
                 str(r["Etiket"]), r_oz["deger"], r_oz["maliyet"],
                 r_oz["gunluk_tutar"], r_oz["gunluk_pct"],
-                r_oz["kz"], r_oz["kz_pct"]))
+                r_oz["kz"], r_oz["kz_pct"], cur))
 
         parcalar.append(
             f'<details class="pf-group"><summary>{baslik}</summary>'
@@ -4865,8 +4919,9 @@ def render_portfoy_ozeti(df: pd.DataFrame) -> None:
         f"{len(calisma)} pozisyon, {len(grup_sirasi)} grup · bir gruba "
         "dokunarak içindeki varlıkları açıp kapatabilirsiniz · **Günlük** bir "
         "önceki güne göre, **Toplam** maliyete göre kâr/zarardır · "
-        f"tutarlar {GOSTER} cinsinden gösterilir, üstteki para birimi "
-        "seçiciyle değiştirebilirsiniz.")
+        "ABD hisseleri, ABD ETF/sabit getirili ve kripto grupları her zaman "
+        f"**dolar** ($) ile gösterilir; diğer gruplar üstteki genel para "
+        f"birimi seçicisine ({GOSTER}) uyar.")
 
 
 # ============================== POZİSYONLAR =================================

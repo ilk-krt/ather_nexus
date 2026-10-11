@@ -14,8 +14,8 @@ from __future__ import annotations
 # Derleyici üretir. Amacı tek bir soruyu kesin cevaplamak: "yüklediğim dosya
 # gerçekten çalışıyor mu?" Uygulama bunu başlıkta ve Ayarlar'da gösterir;
 # yüklediğiniz dosyanınkiyle aynı değilse yayındaki sürüm eski demektir.
-BUILD_ID = "2b52d247e6"
-BUILD_TIME = "2026-10-02 12:40"
+BUILD_ID = "b427de16e9"
+BUILD_TIME = "2026-10-11 20:16"
 
 
 # ==========================================================================
@@ -3737,6 +3737,7 @@ an = hist = imp = ins = px = _Namespace()
 
 
 
+import html
 import json
 import logging
 
@@ -3835,6 +3836,62 @@ st.markdown(
     }
     .badge.pos { background: rgba(47,190,134,.13); }
     .badge.neg { background: rgba(240,115,111,.13); }
+
+    /* --- Portföy özeti: gruplar + katlanır bileşenler ---
+       Native <details>/<summary> kullanıyoruz; st.expander'ın aksine başlık
+       satırının TAMAMINI (isim + değer + değişim rakamları) tıklanabilir
+       yapıp istediğimiz HTML'i serbestçe yerleştirebiliyoruz. */
+    .pf-group {
+      background: var(--surface); border: 1px solid var(--line);
+      border-radius: 12px; margin-bottom: .55rem; overflow: hidden;
+    }
+    .pf-group summary {
+      cursor: pointer; list-style: none; -webkit-tap-highlight-color: transparent;
+    }
+    .pf-group summary::-webkit-details-marker { display: none; }
+    .pf-row {
+      display: flex; align-items: center; gap: .6rem;
+      padding: .72rem .85rem; flex-wrap: wrap;
+    }
+    .pf-group > .pf-children > .pf-row {
+      padding: .55rem .85rem .55rem 2rem;
+      border-top: 1px solid var(--line-soft);
+    }
+    .pf-caret {
+      color: var(--ink-3); font-size: .65rem; flex: 0 0 auto;
+      transition: transform .15s ease; display: inline-block;
+    }
+    .pf-group[open] > summary .pf-caret { transform: rotate(90deg); }
+    .pf-name {
+      flex: 1 1 120px; min-width: 0; font-weight: 600; font-size: .9rem;
+      color: var(--ink); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+    .pf-name .pf-count {
+      color: var(--ink-3); font-weight: 400; font-size: .72rem; margin-left: .3rem;
+    }
+    .pf-value { text-align: right; flex: 0 0 auto; min-width: 86px; }
+    .pf-value .v { font-weight: 700; font-size: .87rem; color: var(--ink); }
+    .pf-value .c { font-size: .68rem; color: var(--ink-3); margin-top: .05rem; }
+    .pf-chg { text-align: right; flex: 0 0 auto; min-width: 84px; }
+    .pf-chg .lbl {
+      font-size: .6rem; text-transform: uppercase; letter-spacing: .06em;
+      color: var(--ink-3); margin-bottom: .1rem;
+    }
+    .pf-chg .amt { font-weight: 600; font-size: .8rem; color: var(--ink-2); }
+    .pf-chg .pct { font-size: .72rem; color: var(--ink-3); }
+    .pf-chg.pos .amt, .pf-chg.pos .pct { color: var(--pos); }
+    .pf-chg.neg .amt, .pf-chg.neg .pct { color: var(--neg); }
+    .pf-children { padding-bottom: .25rem; }
+    @media (max-width: 640px) {
+      .pf-row { gap: .35rem; padding: .62rem .55rem; }
+      .pf-group > .pf-children > .pf-row { padding-left: 1.3rem; }
+      .pf-name { flex-basis: 70px; font-size: .82rem; }
+      .pf-value { min-width: 64px; }
+      .pf-chg { min-width: 62px; }
+      .pf-value .v, .pf-chg .amt { font-size: .74rem; }
+      .pf-value .c, .pf-chg .pct { font-size: .64rem; }
+      .pf-chg .lbl { font-size: .56rem; }
+    }
 
     /* --- Bölüm başlığı --- */
     .nx-section {
@@ -4048,6 +4105,41 @@ def kpi(label: str, value: str, sub: str = "", tone: str = "") -> str:
     return (f"<div class='kpi{cls}'><div class='kpi-label'>{label}</div>"
             f"<div class='kpi-value{cls}'>{value}</div>"
             f"<div class='kpi-sub{cls}'>{sub}</div></div>")
+
+
+def _pf_chg_html(etiket: str, tutar: float, pct: float) -> str:
+    """Portföy özeti satırlarındaki tek bir değişim hücresi (Günlük/Toplam).
+
+    Tutar NaN ise (ör. hiç fiyat verisi olmayan grup) renksiz '—' gösterir;
+    aksi halde işaret + renk (yeşil/kırmızı) otomatik belirlenir.
+    """
+    if tutar != tutar:  # NaN
+        return (f'<div class="pf-chg"><div class="lbl">{html.escape(etiket)}</div>'
+                f'<div class="amt">—</div></div>')
+    yon = "pos" if tutar >= 0 else "neg"
+    isaret = "+" if tutar >= 0 else ""
+    pct_metin = f"{pct:+.2f}%" if pct == pct else "—"
+    return (f'<div class="pf-chg {yon}"><div class="lbl">{html.escape(etiket)}</div>'
+            f'<div class="amt">{isaret}{fmt_try(tutar)}</div>'
+            f'<div class="pct">{pct_metin}</div></div>')
+
+
+def _pf_row_html(ad: str, deger: float, maliyet: float,
+                 gunluk_tutar: float, gunluk_pct: float,
+                 toplam_tutar: float, toplam_pct: float,
+                 n: int | None = None, caret: bool = False) -> str:
+    sayac = f'<span class="pf-count">· {n} varlık</span>' if n else ""
+    oklu_ad = (f'<span class="pf-caret">▸</span>{html.escape(ad)}' if caret
+               else html.escape(ad))
+    maliyet_html = (f'<div class="c">maliyet {fmt_try(maliyet)}</div>'
+                    if maliyet and maliyet > 0 else "")
+    return (
+        f'<div class="pf-row">'
+        f'<div class="pf-name">{oklu_ad}{sayac}</div>'
+        f'<div class="pf-value"><div class="v">{fmt_try(deger)}</div>{maliyet_html}</div>'
+        f'{_pf_chg_html("Günlük", gunluk_tutar, gunluk_pct)}'
+        f'{_pf_chg_html("Toplam", toplam_tutar, toplam_pct)}'
+        f'</div>')
 
 
 # ---------------------------------------------------------------------------
@@ -4678,76 +4770,176 @@ with tab_dag:
                                  format="%,.0f"),
                                  "Pay %": st.column_config.NumberColumn(format="%.2f%%")})
 
-# ============================== POZİSYONLAR =================================
-with tab_poz:
+def _pf_grup_adi(row: pd.Series) -> str:
+    """
+    Üst seviye grup adı — kullanıcının istediği "Bist / US Stock / Fon…"
+    ayrımını verir. Hisse Senedi tek sınıfta toplanmış olsaydı BIST ile ABD
+    hisseleri aynı grupta karışırdı; bu yüzden SADECE hisselerde Alt Sınıf'a
+    (BIST/ABD) iniyoruz, diğer her şeyde Ana Sınıf yeterli (Fon, Kripto,
+    Altın/Gümüş hepsi "Emtia" vb. tek grup).
+    """
+    if row["Ana Sınıf"] == "Hisse Senedi":
+        return str(row["Alt Sınıf"]) or "Hisse Senedi"
+    return str(row["Ana Sınıf"])
+
+
+def _pf_grup_ozet(alt: pd.DataFrame) -> dict[str, float]:
+    """
+    Bir grubun (ya da tek bir varlığın) özet rakamları.
+
+    Günlük değişim NAIF yüzde ortalaması DEĞİL — her satırın "bir önceki
+    günkü değeri" (bugünkü değer / (1 + %değişim/100)) tek tek hesaplanıp
+    toplanıyor, grup yüzdesi bu iki toplamdan türetiliyor. Böylece büyük
+    pozisyonlar küçüklerle aynı ağırlıkta sayılmıyor (değer-ağırlıklı doğru
+    getiri). Fiyatı çekilemeyen ya da günlük verisi olmayan satırlar hem
+    payda hem paydan çıkarılır — "Değer"e hâlâ dahildirler, sadece günlük
+    hesaba katılmazlar.
+    """
+    deger = float(alt["Değer (TRY)"].sum(skipna=True))
+    maliyet = float(alt["Maliyet (TRY)"].sum(skipna=True))
+    kz = float(alt["K/Z (TRY)"].sum(skipna=True))
+    kz_pct = (kz / maliyet * 100.0) if maliyet > 0 else float("nan")
+
+    gunluk_var = alt
+    if "1G %" in alt.columns:
+        gunluk_var = alt[alt["1G %"].notna() & alt["Fiyat OK"]]
+    else:
+        gunluk_var = alt.iloc[0:0]
+    if not gunluk_var.empty:
+        bugun = gunluk_var["Değer (TRY)"]
+        onceki = bugun / (1.0 + gunluk_var["1G %"] / 100.0)
+        onceki_toplam = float(onceki.sum())
+        gunluk_tutar = float(bugun.sum()) - onceki_toplam
+        gunluk_pct = (gunluk_tutar / onceki_toplam * 100.0) if onceki_toplam > 0 else float("nan")
+    else:
+        gunluk_tutar = float("nan")
+        gunluk_pct = float("nan")
+
+    return dict(deger=deger, maliyet=maliyet, kz=kz, kz_pct=kz_pct,
+               gunluk_tutar=gunluk_tutar, gunluk_pct=gunluk_pct)
+
+
+def render_portfoy_ozeti(df: pd.DataFrame) -> None:
+    """
+    "Portföy özeti" — gruplanmış, katlanır varlık görünümü.
+
+    Eskiden Pozisyonlar sekmesi tek, dev ve düz bir tablo (113 satır) idi;
+    kullanıcı "ilk rakam / son rakam" tarzı dönem dökümünü karışık buldu ve
+    BIST/ABD/Fon gibi gruplar altında, her grubu açıp kapatabildiği, günlük +
+    toplam kâr/zararı tek bakışta gösteren basit bir liste istedi (ekran
+    görüntüsüyle örnekledi). Eski detaylı tablo hâlâ var ama artık bir
+    "Detaylı tablo" açılır panelinin içinde — varsayılan görünüm bu.
+    """
+    section("Portföy özeti")
     if df.empty:
         st.info("Henüz pozisyon yok.")
-    else:
-        _don = list(an.PERIOD_GUN)
-        _mevcut_don = [d for d in _don if d in df.columns]
-        _sec = st.radio("Sırala / vurgula", ["Ağırlık"] + _mevcut_don + ["Toplam"],
-                        horizontal=True, key="poz_donem",
-                        help="Tablo bu sütuna göre sıralanır. Bütün dönemler "
-                             "tabloda durur; başlıklara tıklayıp kendiniz de "
-                             "sıralayabilirsiniz.")
+        return
 
-        _kapsam = st.columns([2, 2, 3])
-        _sinif = _kapsam[0].multiselect(
-            "Ana sınıf", sorted(df["Ana Sınıf"].dropna().unique()),
-            key="poz_sinif")
-        _hesap = _kapsam[1].multiselect(
-            "Hesap", sorted(x for x in df["Hesap"].dropna().unique() if x),
-            key="poz_hesap")
+    calisma = df.copy()
+    calisma["_grup"] = calisma.apply(_pf_grup_adi, axis=1)
+    grup_sirasi = (calisma.groupby("_grup")["Değer (TRY)"].sum(min_count=1)
+                  .sort_values(ascending=False).index.tolist())
 
-        _t = df.copy()
-        if _sinif:
-            _t = _t[_t["Ana Sınıf"].isin(_sinif)]
-        if _hesap:
-            _t = _t[_t["Hesap"].isin(_hesap)]
+    parcalar: list[str] = []
+    for g in grup_sirasi:
+        alt = calisma[calisma["_grup"] == g]
+        oz = _pf_grup_ozet(alt)
+        baslik = _pf_row_html(g, oz["deger"], oz["maliyet"], oz["gunluk_tutar"],
+                              oz["gunluk_pct"], oz["kz"], oz["kz_pct"],
+                              n=len(alt), caret=True)
 
-        # Kendi para biriminde fiyat/maliyet; değer seçili para biriminde.
-        _t["Değer"] = _t["Değer (TRY)"] * GOSTER_ORAN
-        _t["Toplam %"] = _t["K/Z %"]
-        _t["K/Z"] = _t["K/Z (TRY)"] * GOSTER_ORAN
+        cocuklar: list[str] = []
+        for _, r in alt.sort_values("Değer (TRY)", ascending=False).iterrows():
+            r_oz = _pf_grup_ozet(alt.loc[[r.name]])
+            cocuklar.append(_pf_row_html(
+                str(r["Etiket"]), r_oz["deger"], r_oz["maliyet"],
+                r_oz["gunluk_tutar"], r_oz["gunluk_pct"],
+                r_oz["kz"], r_oz["kz_pct"]))
 
-        _sirala = {"Ağırlık": "Ağırlık %", "Toplam": "Toplam %"}.get(_sec, _sec)
-        _t = _t.sort_values(_sirala, ascending=False, na_position="last")
+        parcalar.append(
+            f'<details class="pf-group"><summary>{baslik}</summary>'
+            f'<div class="pf-children">{"".join(cocuklar)}</div></details>')
 
-        _sutunlar = (["Etiket", "Hesap", "Para Birimi", "Ağırlık %", "Adet",
-                      "Maliyet", "Fiyat", "Değer", "K/Z", "Toplam %"]
-                     + _mevcut_don)
-        _gorunum = _t[[c for c in _sutunlar if c in _t.columns]].rename(
-            columns={"Etiket": "Sembol", "Maliyet": "Ort. Maliyet",
-                     "Fiyat": "Güncel Fiyat", "Değer": f"Değer ({GOSTER})",
-                     "K/Z": f"K/Z ({GOSTER})"})
+    st.markdown("".join(parcalar), unsafe_allow_html=True)
+    st.caption(
+        f"{len(calisma)} pozisyon, {len(grup_sirasi)} grup · bir gruba "
+        "dokunarak içindeki varlıkları açıp kapatabilirsiniz · **Günlük** bir "
+        "önceki güne göre, **Toplam** maliyete göre kâr/zarardır · "
+        f"tutarlar {GOSTER} cinsinden gösterilir, üstteki para birimi "
+        "seçiciyle değiştirebilirsiniz.")
 
-        _cfg = {
-            "Ağırlık %": st.column_config.ProgressColumn(
-                format="%.2f%%", min_value=0.0,
-                max_value=float(_t["Ağırlık %"].max(skipna=True) or 100)),
-            "Adet": st.column_config.NumberColumn(format="%,.4f"),
-            "Ort. Maliyet": st.column_config.NumberColumn(format="%,.4f"),
-            "Güncel Fiyat": st.column_config.NumberColumn(format="%,.4f"),
-            f"Değer ({GOSTER})": st.column_config.NumberColumn(format="%,.0f"),
-            f"K/Z ({GOSTER})": st.column_config.NumberColumn(format="%+,.0f"),
-            "Toplam %": st.column_config.NumberColumn(format="%+.2f%%"),
-        }
-        for _d in _mevcut_don:
-            _cfg[_d] = st.column_config.NumberColumn(format="%+.2f%%")
 
-        st.dataframe(_gorunum, width="stretch", hide_index=True,
-                     column_config=_cfg, height=560)
+# ============================== POZİSYONLAR =================================
+with tab_poz:
+    render_portfoy_ozeti(df)
 
-        _eksik_don = [d for d in _don if d not in df.columns]
-        st.caption(
-            f"{len(_gorunum)} pozisyon · fiyat ve maliyet varlığın KENDİ para "
-            f"biriminde, değer {GOSTER} cinsinden · dönem getirileri {GOSTER} "
-            f"bazlı"
-            + (f" · şu dönemler için yeterli geçmiş yok: {', '.join(_eksik_don)}"
-               if _eksik_don else ""))
-        st.download_button(
-            "⬇️ CSV indir", _gorunum.to_csv(index=False).encode("utf-8-sig"),
-            "pozisyonlar.csv", "text/csv")
+    if not df.empty:
+        with st.expander("📋 Detaylı tablo (filtrele, sırala, CSV indir)"):
+            _don = list(an.PERIOD_GUN)
+            _mevcut_don = [d for d in _don if d in df.columns]
+            _sec = st.radio("Sırala / vurgula", ["Ağırlık"] + _mevcut_don + ["Toplam"],
+                            horizontal=True, key="poz_donem",
+                            help="Tablo bu sütuna göre sıralanır. Bütün dönemler "
+                                 "tabloda durur; başlıklara tıklayıp kendiniz de "
+                                 "sıralayabilirsiniz.")
+
+            _kapsam = st.columns([2, 2, 3])
+            _sinif = _kapsam[0].multiselect(
+                "Ana sınıf", sorted(df["Ana Sınıf"].dropna().unique()),
+                key="poz_sinif")
+            _hesap = _kapsam[1].multiselect(
+                "Hesap", sorted(x for x in df["Hesap"].dropna().unique() if x),
+                key="poz_hesap")
+
+            _t = df.copy()
+            if _sinif:
+                _t = _t[_t["Ana Sınıf"].isin(_sinif)]
+            if _hesap:
+                _t = _t[_t["Hesap"].isin(_hesap)]
+
+            # Kendi para biriminde fiyat/maliyet; değer seçili para biriminde.
+            _t["Değer"] = _t["Değer (TRY)"] * GOSTER_ORAN
+            _t["Toplam %"] = _t["K/Z %"]
+            _t["K/Z"] = _t["K/Z (TRY)"] * GOSTER_ORAN
+
+            _sirala = {"Ağırlık": "Ağırlık %", "Toplam": "Toplam %"}.get(_sec, _sec)
+            _t = _t.sort_values(_sirala, ascending=False, na_position="last")
+
+            _sutunlar = (["Etiket", "Hesap", "Para Birimi", "Ağırlık %", "Adet",
+                          "Maliyet", "Fiyat", "Değer", "K/Z", "Toplam %"]
+                         + _mevcut_don)
+            _gorunum = _t[[c for c in _sutunlar if c in _t.columns]].rename(
+                columns={"Etiket": "Sembol", "Maliyet": "Ort. Maliyet",
+                         "Fiyat": "Güncel Fiyat", "Değer": f"Değer ({GOSTER})",
+                         "K/Z": f"K/Z ({GOSTER})"})
+
+            _cfg = {
+                "Ağırlık %": st.column_config.ProgressColumn(
+                    format="%.2f%%", min_value=0.0,
+                    max_value=float(_t["Ağırlık %"].max(skipna=True) or 100)),
+                "Adet": st.column_config.NumberColumn(format="%,.4f"),
+                "Ort. Maliyet": st.column_config.NumberColumn(format="%,.4f"),
+                "Güncel Fiyat": st.column_config.NumberColumn(format="%,.4f"),
+                f"Değer ({GOSTER})": st.column_config.NumberColumn(format="%,.0f"),
+                f"K/Z ({GOSTER})": st.column_config.NumberColumn(format="%+,.0f"),
+                "Toplam %": st.column_config.NumberColumn(format="%+.2f%%"),
+            }
+            for _d in _mevcut_don:
+                _cfg[_d] = st.column_config.NumberColumn(format="%+.2f%%")
+
+            st.dataframe(_gorunum, width="stretch", hide_index=True,
+                         column_config=_cfg, height=560)
+
+            _eksik_don = [d for d in _don if d not in df.columns]
+            st.caption(
+                f"{len(_gorunum)} pozisyon · fiyat ve maliyet varlığın KENDİ para "
+                f"biriminde, değer {GOSTER} cinsinden · dönem getirileri {GOSTER} "
+                f"bazlı"
+                + (f" · şu dönemler için yeterli geçmiş yok: {', '.join(_eksik_don)}"
+                   if _eksik_don else ""))
+            st.download_button(
+                "⬇️ CSV indir", _gorunum.to_csv(index=False).encode("utf-8-sig"),
+                "pozisyonlar.csv", "text/csv")
 
 # ================================ ANALİZ ====================================
 with tab_analiz:

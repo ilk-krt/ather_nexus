@@ -14,8 +14,8 @@ from __future__ import annotations
 # Derleyici üretir. Amacı tek bir soruyu kesin cevaplamak: "yüklediğim dosya
 # gerçekten çalışıyor mu?" Uygulama bunu başlıkta ve Ayarlar'da gösterir;
 # yüklediğiniz dosyanınkiyle aynı değilse yayındaki sürüm eski demektir.
-BUILD_ID = "03d2db9688"
-BUILD_TIME = "2026-10-12 11:56"
+BUILD_ID = "02584f3d27"
+BUILD_TIME = "2026-10-12 12:08"
 
 
 # ==========================================================================
@@ -3989,6 +3989,24 @@ st.markdown(
       filter: brightness(1.1); color: #04141a !important;
     }
 
+    /* "Varlık sil" düğmesi: silme işlemi olduğu çok açık olsun diye kırmızı
+       (diğer tüm birincil düğmeler marka rengi camgöbeği kalıyor). */
+    .st-key-sil_buton_kutu .stButton > button[kind="primary"] {
+      background: #d64545 !important; border-color: #d64545 !important;
+      color: #fff !important;
+    }
+    .st-key-sil_buton_kutu .stButton > button[kind="primary"] * { color: #fff !important; }
+    .st-key-sil_buton_kutu .stButton > button[kind="primary"]:hover {
+      background: #c23a3a !important; border-color: #c23a3a !important;
+    }
+    .st-key-sil_buton_kutu .stButton > button[kind="primary"]:disabled {
+      background: var(--surface-2) !important; border-color: #2b2b36 !important;
+      color: var(--ink-3) !important; opacity: .7;
+    }
+    .st-key-sil_buton_kutu .stButton > button[kind="primary"]:disabled * {
+      color: var(--ink-3) !important;
+    }
+
     /* Dönem seçici (radio) düğme görünümünde */
     div[role="radiogroup"] > label {
       background: var(--surface-2); border: 1px solid #2b2b36;
@@ -5335,32 +5353,39 @@ with tab_hisse:
 with tab_duzen:
     st.markdown(
         "Tablodaki her alanı doğrudan düzenleyebilirsiniz. **Satır eklemek** için "
-        "en alttaki boş satırı doldurun. **Silmek** için: bilgisayarda satırın "
-        "solundaki kutuyu işaretleyip klavyeden <kbd>Delete</kbd> tuşuna "
-        "basabilirsiniz; telefonda bu tuş genelde olmadığı için hemen "
-        "aşağıdaki **Varlık sil** kutusunu kullanın. Tablodaki diğer "
-        "değişiklikler *Kaydet*'e basana kadar yazılmaz; **Varlık sil** ise "
-        "seçer seçmez hemen kaydedilir.",
-        unsafe_allow_html=True)
+        "en alttaki boş satırı doldurun — değişiklikler *Kaydet*'e basana "
+        "kadar yazılmaz. **Silmek** için aşağıdaki **Varlık sil** kutusunu "
+        "kullanın: varlığı seçin, kırmızı **🗑️ Sil** düğmesine basın — hemen "
+        "silinir, ayrıca Kaydet'e basmaya gerek yok.")
 
     if "editor_version" not in st.session_state:
         st.session_state.editor_version = 0
 
     if assets:
+        section("Varlık sil")
         _sil_etiket = {
             asset_key(a): (str(a.get("display") or a["symbol"])
                           + (f" · {a['hesap']}" if a.get("hesap") else ""))
             for a in assets
         }
         _sil_secim = st.multiselect(
-            "🗑️ Varlık sil (telefonda en kolay yol — Delete tuşu gerekmez)",
+            "Silinecek varlık(lar)",
             options=list(_sil_etiket),
             format_func=lambda k: _sil_etiket.get(k, k),
             key=f"sil_secim_{st.session_state.editor_version}",
-            help="Silmek istediğiniz varlık(lar)ı buradan seçip altındaki "
-                 "düğmeye basın.")
-        if _sil_secim and st.button(
-                f"🗑️ Seçilen {len(_sil_secim)} varlığı sil", width="stretch"):
+            label_visibility="collapsed",
+            placeholder="Silmek istediğiniz varlığı/varlıkları buradan seçin…")
+        # Düğme HER ZAMAN görünür (seçim yapana kadar sadece tıklanamaz,
+        # kırmızı) — yalnızca bir şey seçildiğinde belirmesi "delete düğmesi
+        # yok" yanılgısına yol açıyordu. st.container(key=...) sayesinde bu
+        # TEK düğmeyi diğer birincil düğmelerden farklı (kırmızı) boyayabiliyoruz.
+        with st.container(key="sil_buton_kutu"):
+            sil_tiklandi = st.button(
+                (f"🗑️ Seçilen {len(_sil_secim)} varlığı sil" if _sil_secim
+                 else "🗑️ Sil"),
+                width="stretch", type="primary", disabled=not _sil_secim,
+                key=f"sil_btn_{st.session_state.editor_version}")
+        if sil_tiklandi:
             _kalanlar = [a for a in assets if asset_key(a) not in _sil_secim]
             if save_assets(store, _kalanlar, f"{len(_sil_secim)} varlık silindi"):
                 st.session_state.assets = _kalanlar

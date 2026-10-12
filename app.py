@@ -14,8 +14,8 @@ from __future__ import annotations
 # Derleyici üretir. Amacı tek bir soruyu kesin cevaplamak: "yüklediğim dosya
 # gerçekten çalışıyor mu?" Uygulama bunu başlıkta ve Ayarlar'da gösterir;
 # yüklediğiniz dosyanınkiyle aynı değilse yayındaki sürüm eski demektir.
-BUILD_ID = "487f739f1d"
-BUILD_TIME = "2026-10-11 20:29"
+BUILD_ID = "03d2db9688"
+BUILD_TIME = "2026-10-12 11:56"
 
 
 # ==========================================================================
@@ -5335,13 +5335,39 @@ with tab_hisse:
 with tab_duzen:
     st.markdown(
         "Tablodaki her alanı doğrudan düzenleyebilirsiniz. **Satır eklemek** için "
-        "en alttaki boş satırı doldurun, **silmek** için satırın solundaki kutuyu "
-        "işaretleyip <kbd>Delete</kbd> tuşuna basın. Değişiklikler *Kaydet*'e "
-        "basana kadar yazılmaz.",
+        "en alttaki boş satırı doldurun. **Silmek** için: bilgisayarda satırın "
+        "solundaki kutuyu işaretleyip klavyeden <kbd>Delete</kbd> tuşuna "
+        "basabilirsiniz; telefonda bu tuş genelde olmadığı için hemen "
+        "aşağıdaki **Varlık sil** kutusunu kullanın. Tablodaki diğer "
+        "değişiklikler *Kaydet*'e basana kadar yazılmaz; **Varlık sil** ise "
+        "seçer seçmez hemen kaydedilir.",
         unsafe_allow_html=True)
 
     if "editor_version" not in st.session_state:
         st.session_state.editor_version = 0
+
+    if assets:
+        _sil_etiket = {
+            asset_key(a): (str(a.get("display") or a["symbol"])
+                          + (f" · {a['hesap']}" if a.get("hesap") else ""))
+            for a in assets
+        }
+        _sil_secim = st.multiselect(
+            "🗑️ Varlık sil (telefonda en kolay yol — Delete tuşu gerekmez)",
+            options=list(_sil_etiket),
+            format_func=lambda k: _sil_etiket.get(k, k),
+            key=f"sil_secim_{st.session_state.editor_version}",
+            help="Silmek istediğiniz varlık(lar)ı buradan seçip altındaki "
+                 "düğmeye basın.")
+        if _sil_secim and st.button(
+                f"🗑️ Seçilen {len(_sil_secim)} varlığı sil", width="stretch"):
+            _kalanlar = [a for a in assets if asset_key(a) not in _sil_secim]
+            if save_assets(store, _kalanlar, f"{len(_sil_secim)} varlık silindi"):
+                st.session_state.assets = _kalanlar
+                cached_snapshot.clear()
+                st.session_state.editor_version += 1
+                st.success(f"{len(_sil_secim)} varlık silindi.")
+                st.rerun()
 
     edited = st.data_editor(
         assets_to_editor(assets),

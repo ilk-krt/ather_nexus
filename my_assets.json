@@ -816,23 +816,6 @@
     "notlar": "PORTFÖY.xlsx · 2026-09-24"
   },
   {
-    "symbol": "AI",
-    "display": "AI",
-    "source": "yahoo",
-    "valuation": "qty",
-    "currency": "USD",
-    "ana_sinif": "Hisse Senedi",
-    "alt_sinif": "ABD",
-    "sektor": "Teknoloji / Yazılım",
-    "hesap": "Midas",
-    "unit": null,
-    "qty": 155.72,
-    "avg_cost": 11.41,
-    "cost_currency": "USD",
-    "manual_price": null,
-    "notlar": "PORTFÖY.xlsx · 2026-09-24"
-  },
-  {
     "symbol": "PGY",
     "display": "PGY",
     "source": "yahoo",

@@ -1853,8 +1853,8 @@
     "notlar": "PORTFÖY_1.xlsx · 2026-10-02 · eksik olan pozisyon eklendi"
   },
   {
-    "symbol": "eose",
-    "display": "eose",
+    "symbol": "EOSE",
+    "display": "EOSE",
     "source": "yahoo",
     "valuation": "qty",
     "currency": "USD",
@@ -1870,8 +1870,8 @@
     "notlar": ""
   },
   {
-    "symbol": "alab",
-    "display": "alab",
+    "symbol": "ALAB",
+    "display": "ALAB",
     "source": "yahoo",
     "valuation": "qty",
     "currency": "USD",
@@ -1880,8 +1880,8 @@
     "sektor": "Diğer ABD",
     "hesap": "IBKR",
     "unit": null,
-    "qty": 346.17,
-    "avg_cost": 10.0,
+    "qty": 10.0,
+    "avg_cost": 346.17,
     "cost_currency": "USD",
     "manual_price": null,
     "notlar": ""
